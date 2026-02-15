@@ -4,13 +4,13 @@ node_modules/
 # Build output
 dist/
 
-# Runtime data — databases, encrypted configs, sessions, IPC, env files
-store/
+# Runtime data — databases, encrypted configs, sessions, IPC, env files, agent workspaces
+# All personal data, auto-created at startup, must not be committed.
 data/
 logs/
 
-# Groups — agent workspace, memory (CLAUDE.md), conversations, user uploads, execution logs
-# All personal data, auto-created at startup, must not be committed.
+# Legacy directories (migrated into data/ on first startup)
+store/
 groups/
 
 # Environment variables (may contain API keys and secrets)

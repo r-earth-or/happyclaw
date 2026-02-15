@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { STORE_DIR } from './config.js';
+import { STORE_DIR, GROUPS_DIR } from './config.js';
 import {
   AuthAuditLog,
   AuthEventType,
@@ -61,7 +61,7 @@ function assertSchema(
   if (missing.length > 0 || forbidden.length > 0) {
     throw new Error(
       `Incompatible DB schema in table "${tableName}". Missing: [${missing.join(', ')}], forbidden: [${forbidden.join(', ')}]. ` +
-        'Please remove store/messages.db and restart.',
+        'Please remove data/db/messages.db (or legacy store/messages.db) and restart.',
     );
   }
 }
@@ -379,6 +379,27 @@ export function initDatabase(): void {
     UPDATE registered_groups SET created_by = (
       SELECT id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY created_at ASC LIMIT 1
     ) WHERE jid = 'web:main' AND created_by IS NULL
+  `);
+
+  // Backfill created_by for feishu/telegram groups by matching sibling groups in the same folder.
+  // Only backfill when the folder has exactly one distinct owner; otherwise keep NULL
+  // to avoid misrouting in ambiguous folders (e.g., shared admin main).
+  db.exec(`
+    UPDATE registered_groups
+    SET created_by = (
+      SELECT MIN(rg2.created_by)
+      FROM registered_groups rg2
+      WHERE rg2.folder = registered_groups.folder
+        AND rg2.created_by IS NOT NULL
+    )
+    WHERE (jid LIKE 'feishu:%' OR jid LIKE 'telegram:%')
+      AND created_by IS NULL
+      AND (
+        SELECT COUNT(DISTINCT rg3.created_by)
+        FROM registered_groups rg3
+        WHERE rg3.folder = registered_groups.folder
+          AND rg3.created_by IS NOT NULL
+      ) = 1
   `);
 
   // v13 migration: mark existing web:main group as is_home=1
@@ -1000,6 +1021,21 @@ export function ensureUserHomeGroup(
 
   // Ensure chat row exists
   ensureChatExists(jid);
+
+  // Create user-global memory directory and initialize CLAUDE.md from template
+  const userGlobalDir = path.join(GROUPS_DIR, 'user-global', userId);
+  fs.mkdirSync(userGlobalDir, { recursive: true });
+  const userClaudeMd = path.join(userGlobalDir, 'CLAUDE.md');
+  if (!fs.existsSync(userClaudeMd)) {
+    const templatePath = path.resolve(process.cwd(), 'config', 'global-claude-md.template.md');
+    if (fs.existsSync(templatePath)) {
+      try {
+        fs.writeFileSync(userClaudeMd, fs.readFileSync(templatePath, 'utf-8'), { flag: 'wx' });
+      } catch {
+        // EEXIST race or read error — ignore
+      }
+    }
+  }
 
   return jid;
 }

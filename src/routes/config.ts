@@ -508,6 +508,16 @@ configRoutes.get('/appearance/public', (c) => {
   }
 });
 
+// ─── Per-user IM connection status ──────────────────────────────────
+
+configRoutes.get('/user-im/status', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  return c.json({
+    feishu: deps?.isUserFeishuConnected?.(user.id) ?? false,
+    telegram: deps?.isUserTelegramConnected?.(user.id) ?? false,
+  });
+});
+
 // ─── Per-user IM config (all logged-in users) ─────────────────────
 
 configRoutes.get('/user-im/feishu', authMiddleware, (c) => {

@@ -182,7 +182,9 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
                   executionMode={mainGroup.execution_mode}
                   isActive={currentGroup === mainGroup.jid}
                   isHome
+                  editable
                   onSelect={handleGroupSelect}
+                  onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                   onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
                 />
                 <div className="mx-2 border-b" />

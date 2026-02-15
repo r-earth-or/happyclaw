@@ -8,12 +8,13 @@ import { Button } from '@/components/ui/button';
 interface MemorySource {
   path: string;
   label: string;
-  scope: 'global' | 'main' | 'flow' | 'session';
+  scope: 'user-global' | 'main' | 'flow' | 'session';
   kind: 'claude' | 'note' | 'session';
   writable: boolean;
   exists: boolean;
   updatedAt: string | null;
   size: number;
+  ownerName?: string;
 }
 
 interface MemoryFile {
@@ -41,8 +42,8 @@ function getErrorMessage(err: unknown, fallback: string): string {
 
 function scopeLabel(scope: MemorySource['scope']): string {
   switch (scope) {
-    case 'global':
-      return '全局';
+    case 'user-global':
+      return '我的全局记忆';
     case 'main':
       return '主会话';
     case 'flow':
@@ -83,7 +84,7 @@ export function MemoryPage() {
 
   const groupedSources = useMemo(() => {
     const groups: Record<MemorySource['scope'], MemorySource[]> = {
-      global: [],
+      'user-global': [],
       main: [],
       flow: [],
       session: [],
@@ -124,9 +125,10 @@ export function MemoryPage() {
       let nextSelected = selectedPath && available.has(selectedPath) ? selectedPath : null;
 
       if (!nextSelected) {
+        // Default: first user-global CLAUDE.md, then main, then first available
         nextSelected =
-          data.sources.find((s) => s.path === 'groups/global/CLAUDE.md')?.path ||
-          data.sources.find((s) => s.path === 'groups/main/CLAUDE.md')?.path ||
+          data.sources.find((s) => s.scope === 'user-global' && s.kind === 'claude')?.path ||
+          data.sources.find((s) => s.scope === 'main' && s.kind === 'claude')?.path ||
           data.sources[0]?.path ||
           null;
       }
@@ -235,7 +237,7 @@ export function MemoryPage() {
             <div>
               <h1 className="text-2xl font-bold text-slate-900">记忆管理</h1>
               <p className="text-sm text-slate-500 mt-0.5">
-                统一管理全局记忆、主会话记忆、各会话流记忆，以及可读取的自动记忆文件。
+                管理个人全局记忆、主会话记忆、各会话流记忆，以及可读取的自动记忆文件。
               </p>
             </div>
           </div>
@@ -264,7 +266,7 @@ export function MemoryPage() {
             </div>
 
             <div className="space-y-4 max-h-[560px] overflow-auto pr-1">
-              {(['global', 'main', 'flow', 'session'] as const).map((scope) => {
+              {(['user-global', 'main', 'flow', 'session'] as const).map((scope) => {
                 const items = groupedSources[scope];
                 if (items.length === 0) return null;
                 return (

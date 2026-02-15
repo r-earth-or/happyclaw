@@ -7,11 +7,13 @@ import {
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
+import { DATA_DIR, GROUPS_DIR } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
   canAccessGroup,
   canModifyGroup,
+  canDeleteGroup,
   MAX_GROUP_NAME_LEN,
   getWebDeps,
 } from '../web-context.js';
@@ -202,7 +204,7 @@ function buildGroupsPayload(user: AuthUser): Record<
       folder: group.folder,
       added_at: group.added_at,
       kind: isHome ? 'home' : isWeb ? 'web' : 'feishu',
-      editable: isWeb && !isHome,
+      editable: isWeb,
       deletable: isWeb && !isHome,
       lastMessage: latest?.content,
       lastMessageTime:
@@ -219,9 +221,6 @@ function buildGroupsPayload(user: AuthUser): Record<
 }
 
 function removeFlowArtifacts(folder: string): void {
-  const DATA_DIR = path.join(process.cwd(), 'data');
-  const GROUPS_DIR = path.join(process.cwd(), 'groups');
-
   fs.rmSync(path.join(GROUPS_DIR, folder), { recursive: true, force: true });
   fs.rmSync(path.join(DATA_DIR, 'sessions', folder), {
     recursive: true,
@@ -243,7 +242,6 @@ function removeFlowArtifacts(folder: string): void {
 }
 
 function clearSessionJsonlFiles(folder: string): void {
-  const DATA_DIR = path.join(process.cwd(), 'data');
   const claudeDir = path.join(DATA_DIR, 'sessions', folder, '.claude');
   if (!fs.existsSync(claudeDir)) return;
 
@@ -258,9 +256,6 @@ function clearSessionJsonlFiles(folder: string): void {
 }
 
 function resetWorkspaceForGroup(folder: string): void {
-  const DATA_DIR = path.join(process.cwd(), 'data');
-  const GROUPS_DIR = path.join(process.cwd(), 'groups');
-
   // 1. 清除工作目录（Agent 文件、CLAUDE.md、logs/ 等），然后重建空目录
   const groupDir = path.join(GROUPS_DIR, folder);
   fs.rmSync(groupDir, { recursive: true, force: true });
@@ -517,7 +512,6 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   deps.getRegisteredGroups()[jid] = group;
 
   // 工作区初始化
-  const GROUPS_DIR = path.join(process.cwd(), 'groups');
   const groupDir = path.join(GROUPS_DIR, folder);
 
   try {
@@ -582,7 +576,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
 
-  if (existing.folder === 'main' || !jid.startsWith('web:')) {
+  // Non-web JIDs (feishu/telegram) cannot be renamed by non-admin
+  if (!jid.startsWith('web:') && authUser.role !== 'admin') {
     return c.json({ error: 'This group cannot be edited' }, 403);
   }
 
@@ -611,6 +606,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     containerConfig: existing.containerConfig,
     executionMode: existing.executionMode,
     customCwd: existing.customCwd,
+    created_by: existing.created_by,
+    is_home: existing.is_home,
   };
 
   setRegisteredGroup(jid, updated);
@@ -630,11 +627,11 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   if (!existing) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, existing)) {
+  if (!canDeleteGroup({ id: authUser.id, role: authUser.role }, existing)) {
     return c.json({ error: 'Group not found' }, 404);
   }
 
-  if (existing.folder === 'main' || !jid.startsWith('web:')) {
+  if (!jid.startsWith('web:')) {
     return c.json({ error: 'This group cannot be deleted' }, 403);
   }
 
@@ -874,14 +871,19 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 50, 200);
 
   // is_home 群组合并查询：将同 folder 下所有 JID（web + feishu/telegram IM 通道）的消息合并展示
-  // Only merge siblings that belong to the same owner to prevent cross-user data leakage
+  // - admin: merge all siblings in the folder (shared admin home)
+  // - member: merge only siblings with same owner to prevent cross-user leakage
   const queryJids = [jid];
-  if (group.is_home && group.created_by) {
+  if (group.is_home) {
     const siblingJids = getJidsByFolder(group.folder);
     for (const siblingJid of siblingJids) {
       if (siblingJid === jid) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
-      if (siblingGroup && siblingGroup.created_by === group.created_by) {
+      if (!siblingGroup) continue;
+      if (
+        authUser.role === 'admin' ||
+        (group.created_by && siblingGroup.created_by === group.created_by)
+      ) {
         queryJids.push(siblingJid);
       }
     }

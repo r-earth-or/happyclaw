@@ -4,6 +4,7 @@ import { WebSocket } from 'ws';
 import { RegisteredGroup, UserRole } from './types.js';
 import { GroupQueue } from './group-queue.js';
 import type { AuthUser, NewMessage, MessageCursor } from './types.js';
+import { getJidsByFolder, getRegisteredGroup } from './db.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -26,6 +27,8 @@ export interface WebDeps {
   reloadUserIMConfig?: (userId: string, channel: 'feishu' | 'telegram') => Promise<boolean>;
   isFeishuConnected?: () => boolean;
   isTelegramConnected?: () => boolean;
+  isUserFeishuConnected?: (userId: string) => boolean;
+  isUserTelegramConnected?: (userId: string) => boolean;
 }
 
 export type Variables = {
@@ -100,33 +103,46 @@ export function canAccessGroup(
   // For legacy rows without created_by, resolve owner from sibling home group.
   if (!group.jid.startsWith('web:')) {
     if (group.created_by) return group.created_by === user.id;
-    const groups = deps?.getRegisteredGroups?.();
-    if (groups) {
-      const siblingHome = Object.values(groups).find(
-        (g) => g.is_home && g.folder === group.folder && !!g.created_by,
-      );
-      if (siblingHome?.created_by) {
-        return siblingHome.created_by === user.id;
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      if (jid === group.jid) continue;
+      const sibling = getRegisteredGroup(jid);
+      if (sibling?.is_home && sibling.created_by) {
+        return sibling.created_by === user.id;
       }
     }
-    return true;
+    // Ownership cannot be resolved for this IM group → deny by default.
+    return false;
   }
   if (group.folder === 'main') return false;
   return group.created_by === user.id;
 }
 
 /**
- * Check if a user can modify (rename, delete, reset) a group.
- * - is_home groups cannot be renamed or deleted by anyone (including admin)
- * - Same as canAccessGroup otherwise, but Feishu groups are NOT modifiable by non-admin.
+ * Check if a user can modify (rename, reset) a group.
+ * - Admin can rename any group (including is_home).
+ * - Members can rename their own web groups (not Feishu/Telegram groups).
+ * - Feishu groups are NOT modifiable by non-admin.
  */
 export function canModifyGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
-  if (group.is_home) return false;
   if (user.role === 'admin') return true;
+  if (group.is_home) return group.created_by === user.id;
   if (!group.jid.startsWith('web:')) return false;
   if (group.folder === 'main') return false;
   return group.created_by === user.id;
+}
+
+/**
+ * Check if a user can delete a group.
+ * - is_home groups cannot be deleted by anyone.
+ */
+export function canDeleteGroup(
+  user: { id: string; role: UserRole },
+  group: RegisteredGroup & { jid: string },
+): boolean {
+  if (group.is_home) return false;
+  return canModifyGroup(user, group);
 }

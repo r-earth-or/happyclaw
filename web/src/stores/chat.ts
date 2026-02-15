@@ -120,6 +120,8 @@ interface ChatState {
   streaming: Record<string, StreamingState>;
   thinkingCache: Record<string, string>;
   pendingThinking: Record<string, string>;
+  /** Per-group lock: true while clearHistory is in-flight, prevents race re-injection */
+  clearing: Record<string, boolean>;
   loadGroups: () => Promise<void>;
   selectGroup: (jid: string) => void;
   loadMessages: (jid: string, loadMore?: boolean) => Promise<void>;
@@ -149,6 +151,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streaming: {},
   thinkingCache: {},
   pendingThinking: {},
+  clearing: {},
 
   loadGroups: async () => {
     set({ loading: true });
@@ -217,6 +220,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   refreshMessages: async (jid: string) => {
+    // Skip polling while clearHistory is in-flight to prevent race re-injection
+    if (get().clearing[jid]) return;
+
     const state = get();
     const existing = state.messages[jid] || [];
     const lastTs = existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
@@ -229,6 +235,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const data = await api.get<{ messages: Message[] }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`
       );
+
+      // Re-check clearing lock after async fetch — clearHistory may have started mid-request
+      if (get().clearing[jid]) return;
 
       if (data.messages.length > 0) {
         // Messages from getMessagesAfter are already in ASC order
@@ -346,16 +355,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearHistory: async (jid: string) => {
+    // Set clearing lock BEFORE the API call to block polling & WS injection
+    set((s) => ({ clearing: { ...s.clearing, [jid]: true } }));
+
     try {
       await api.post<{ success: boolean }>(
         `/api/groups/${encodeURIComponent(jid)}/clear-history`,
       );
 
       set((s) => {
-        const nextMessages = { ...s.messages, [jid]: [] };
+        // Delete the key entirely (not []==[]) so selectGroup/ChatView effect
+        // will trigger loadMessages on re-entry
+        const nextMessages = { ...s.messages };
+        delete nextMessages[jid];
         const nextStreaming = { ...s.streaming };
         delete nextStreaming[jid];
         const { [jid]: _pending, ...nextPendingThinking } = s.pendingThinking;
+        const { [jid]: _clearing, ...nextClearing } = s.clearing;
 
         return {
           messages: nextMessages,
@@ -363,6 +379,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           hasMore: { ...s.hasMore, [jid]: false },
           streaming: nextStreaming,
           pendingThinking: nextPendingThinking,
+          clearing: nextClearing,
           thinkingCache: retainThinkingCacheForMessages(
             nextMessages,
             s.thinkingCache,
@@ -376,7 +393,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       useFileStore.getState().loadFiles(jid);
       return true;
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      // Release clearing lock on failure
+      set((s) => {
+        const { [jid]: _, ...nextClearing } = s.clearing;
+        return { clearing: nextClearing, error: err instanceof Error ? err.message : String(err) };
+      });
       return false;
     }
   },
@@ -478,6 +499,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // 处理流式事件
   handleStreamEvent: (chatJid, event) => {
+    // Skip while clearHistory is in-flight
+    if (get().clearing[chatJid]) return;
+
     set((s) => {
       const MAX_STREAMING_TEXT = 8000; // 限制内存中保留的流式文本长度
       const MAX_EVENT_LOG = 30; // 最近事件条数上限
@@ -622,6 +646,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 通过 WebSocket new_message 事件立即添加消息（避免轮询延迟导致消息"丢失"）
   handleWsNewMessage: (chatJid, wsMsg) => {
     if (!wsMsg || !wsMsg.id) return;
+    // Skip while clearHistory is in-flight to prevent race re-injection
+    if (get().clearing[chatJid]) return;
 
     set((s) => {
       const existing = s.messages[chatJid] || [];

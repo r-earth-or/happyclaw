@@ -301,12 +301,13 @@ export const TerminalStopSchema = z.object({
 export interface MemorySource {
   path: string;
   label: string;
-  scope: 'global' | 'main' | 'flow' | 'session';
+  scope: 'user-global' | 'main' | 'flow' | 'session';
   kind: 'claude' | 'note' | 'session';
   writable: boolean;
   exists: boolean;
   updatedAt: string | null;
   size: number;
+  ownerName?: string;
 }
 
 export interface MemoryFilePayload {

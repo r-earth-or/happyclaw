@@ -11,6 +11,7 @@ import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { ArrowLeft, MoreHorizontal, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
+import { api } from '../../api/client';
 import { TerminalPanel } from './TerminalPanel';
 
 const POLL_INTERVAL_MS = 2000;
@@ -37,6 +38,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const [terminalHeight, setTerminalHeight] = useState(TERMINAL_DEFAULT_HEIGHT);
   const [mobileTerminal, setMobileTerminal] = useState(false);
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
+  const [imStatus, setImStatus] = useState<{ feishu: boolean; telegram: boolean } | null>(null);
 
   // Drag state refs (not reactive — only used in event handlers)
   const containerRef = useRef<HTMLDivElement>(null);
@@ -67,6 +69,27 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const isWaiting = waiting[groupJid] || false;
   const hasMoreMessages = hasMore[groupJid] || false;
   const pollRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // Fetch IM connection status for home groups
+  const isHome = !!group?.is_home;
+  const isOwnHome =
+    isHome &&
+    (
+      (!!group?.created_by && group.created_by === currentUser?.id) ||
+      (currentUser?.role === 'admin' && group?.folder === 'main')
+    );
+  useEffect(() => {
+    if (!isOwnHome) { setImStatus(null); return; }
+    let active = true;
+    const fetchStatus = () => {
+      api.get<{ feishu: boolean; telegram: boolean }>('/api/config/user-im/status')
+        .then((data) => { if (active) setImStatus(data); })
+        .catch(() => {});
+    };
+    fetchStatus();
+    const timer = setInterval(fetchStatus, 30_000); // refresh every 30s
+    return () => { active = false; clearInterval(timer); };
+  }, [isOwnHome]);
 
   // Load messages on group select
   const hasMessages = !!messages[groupJid];
@@ -265,9 +288,26 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
         )}
         <div className="flex-1 min-w-0">
           <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
-          <p className="text-xs text-slate-500">
-            {isWaiting ? '正在思考...' : group.is_home ? '主容器' : '容器'}
-          </p>
+          <div className="flex items-center gap-1.5 text-xs text-slate-500">
+            <span>{isWaiting ? '正在思考...' : group.is_home ? '主容器' : '容器'}</span>
+            {isOwnHome && imStatus && (imStatus.feishu || imStatus.telegram) && (
+              <>
+                <span className="text-slate-300">·</span>
+                {imStatus.feishu && (
+                  <span className="inline-flex items-center gap-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    飞书
+                  </span>
+                )}
+                {imStatus.telegram && (
+                  <span className="inline-flex items-center gap-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    Telegram
+                  </span>
+                )}
+              </>
+            )}
+          </div>
         </div>
         {/* Desktop: toggle side panel */}
         <button

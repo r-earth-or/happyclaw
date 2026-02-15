@@ -7,7 +7,7 @@
  */
 import { createFeishuConnection, FeishuConnection } from './feishu.js';
 import { createTelegramConnection, TelegramConnection } from './telegram.js';
-import { getRegisteredGroup } from './db.js';
+import { getRegisteredGroup, getJidsByFolder } from './db.js';
 import { logger } from './logger.js';
 
 export interface UserIMConnection {
@@ -165,17 +165,22 @@ class IMConnectionManager {
       }
     }
 
-    // Fallback: only try admin connections for groups routed to admin home (folder=main)
-    if (group && group.folder === 'main') {
-      for (const adminId of this.adminUserIds) {
-        const conn = this.connections.get(adminId);
-        if (conn?.feishu?.isConnected()) {
-          logger.warn(
-            { chatJid, fallbackUserId: adminId, folder: group.folder },
-            'Feishu message routed via fallback admin connection (admin home group)',
-          );
-          await conn.feishu.sendMessage(chatId, text);
-          return;
+    // Fallback: find owner via sibling groups sharing the same folder
+    if (group) {
+      const siblingJids = getJidsByFolder(group.folder);
+      for (const sibJid of siblingJids) {
+        if (sibJid === chatJid) continue;
+        const sibling = getRegisteredGroup(sibJid);
+        if (sibling?.created_by) {
+          const conn = this.connections.get(sibling.created_by);
+          if (conn?.feishu?.isConnected()) {
+            logger.warn(
+              { chatJid, fallbackUserId: sibling.created_by, folder: group.folder },
+              'Feishu message routed via sibling group owner connection',
+            );
+            await conn.feishu.sendMessage(chatId, text);
+            return;
+          }
         }
       }
     }
@@ -199,17 +204,22 @@ class IMConnectionManager {
       }
     }
 
-    // Fallback: only try admin connections for groups routed to admin home (folder=main)
-    if (group && group.folder === 'main') {
-      for (const adminId of this.adminUserIds) {
-        const conn = this.connections.get(adminId);
-        if (conn?.telegram?.isConnected()) {
-          logger.warn(
-            { chatJid, fallbackUserId: adminId, folder: group.folder },
-            'Telegram message routed via fallback admin connection (admin home group)',
-          );
-          await conn.telegram.sendMessage(chatId, text);
-          return;
+    // Fallback: find owner via sibling groups sharing the same folder
+    if (group) {
+      const siblingJids = getJidsByFolder(group.folder);
+      for (const sibJid of siblingJids) {
+        if (sibJid === chatJid) continue;
+        const sibling = getRegisteredGroup(sibJid);
+        if (sibling?.created_by) {
+          const conn = this.connections.get(sibling.created_by);
+          if (conn?.telegram?.isConnected()) {
+            logger.warn(
+              { chatJid, fallbackUserId: sibling.created_by, folder: group.folder },
+              'Telegram message routed via sibling group owner connection',
+            );
+            await conn.telegram.sendMessage(chatId, text);
+            return;
+          }
         }
       }
     }

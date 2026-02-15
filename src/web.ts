@@ -191,8 +191,13 @@ async function handleWebUserMessage(
 > {
   if (!deps) return { ok: false, status: 500, error: 'Server not initialized' };
 
-  const group = deps.getRegisteredGroups()[chatJid];
-  if (!group) return { ok: false, status: 404, error: 'Group not found' };
+  let group = deps.getRegisteredGroups()[chatJid];
+  if (!group) {
+    // Group may exist in DB but not in memory cache (created via setup/registration after loadState)
+    const dbGroup = getRegisteredGroup(chatJid);
+    if (!dbGroup) return { ok: false, status: 404, error: 'Group not found' };
+    group = dbGroup;
+  }
 
   ensureChatExists(chatJid);
 

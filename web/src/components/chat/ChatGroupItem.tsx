@@ -40,9 +40,10 @@ export function ChatGroupItem({
   onDelete,
 }: ChatGroupItemProps) {
   const currentUser = useAuthStore((s) => s.user);
-  const displayName = isHome
-    ? (currentUser?.role === 'admin' ? '主容器' : '我的工作区')
-    : name;
+  const defaultHomeName = currentUser?.role === 'admin' ? '主容器' : '我的工作区';
+  // Use actual name if it's been renamed, otherwise fall back to default
+  const isDefaultName = !name || name === 'Main' || name === `${currentUser?.username} Home`;
+  const displayName = isHome && isDefaultName ? defaultHomeName : name;
   const truncatedMsg =
     lastMessage && lastMessage.length > 40
       ? lastMessage.substring(0, 40) + '...'
@@ -103,7 +104,7 @@ export function ChatGroupItem({
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-40">
-            {!isHome && editable && onRename && (
+            {editable && onRename && (
               <DropdownMenuItem onClick={() => onRename(jid, name)}>
                 <Pencil className="w-4 h-4" />
                 重命名

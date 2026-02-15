@@ -69,8 +69,7 @@ clean: ## 清理构建产物
 	rm -rf container/agent-runner/dist
 
 reset-init: ## 完全重置为首装状态（清空所有运行时数据）
-	rm -rf store data groups
-	mkdir -p store data/config data/ipc
+	rm -rf data store groups
 	@echo "✅ 已完全重置为首装状态（数据库、配置、工作区、记忆、会话全部清除）"
 
 # ─── Help ────────────────────────────────────────────────────

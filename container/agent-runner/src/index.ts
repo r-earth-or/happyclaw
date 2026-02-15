@@ -463,8 +463,8 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
 }
 
 function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string {
-  if (isAdminHome) {
-    // Admin home container: full memory system with read/write access to global CLAUDE.md
+  if (isHome) {
+    // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
     return [
       '',
       '## 记忆系统',
@@ -481,47 +481,35 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string 
       '根据信息的**时效性**选择存储位置：',
       '',
       '#### 全局记忆（永久）→ 直接编辑 `/workspace/global/CLAUDE.md`',
-      '适用于**长期不变、跨会话始终需要**的信息：',
+      '',
+      '**优先使用全局记忆。** 适用于所有**跨会话仍然有用**的信息：',
       '- 用户身份：姓名、生日、联系方式、地址、工作单位',
-      '- 长期偏好：沟通风格、称呼方式、喜好厌恶',
+      '- 长期偏好：沟通风格、称呼方式、喜好厌恶、技术栈偏好',
       '- 身份配置：你的名字、角色设定、行为准则',
+      '- 常用项目与上下文：反复提到的仓库、服务、架构信息',
+      '- 用户明确要求「记住」的任何内容',
       '',
       '使用 `Read` 工具读取当前内容，再用 `Edit` 工具**原地更新对应字段**。',
+      '文件中标记「待记录」的字段发现信息后**必须立即填写**。',
       '不要追加重复信息，保持文件简洁有序。',
       '',
       '#### 日期记忆（时效性）→ 调用 `memory_append`',
-      '适用于**与时间相关、可能过时**的信息：',
+      '',
+      '适用于**过一段时间会过时**的信息：',
       '- 项目进展：今天做了什么、决定了什么、遇到了什么问题',
-      '- 技术决策：选型理由、架构方案、变更记录',
+      '- 临时技术决策：选型理由、架构方案、变更记录',
       '- 待办与承诺：约定事项、截止日期、后续跟进',
       '- 会议/讨论要点：关键结论、行动项',
       '',
       '`memory_append` 自动保存到独立的记忆目录（不在工作区内）。',
       '',
       '#### 判断标准',
-      '> 问自己：**半年后这条信息还有用吗？**',
-      '> - 是 → 全局记忆（编辑 CLAUDE.md）',
-      '> - 否/不确定 → 日期记忆（memory_append）',
+      '> **默认优先全局记忆。** 问自己：这条信息下次对话还可能用到吗？',
+      '> - 是 / 可能 → **全局记忆**（编辑 `/workspace/global/CLAUDE.md`）',
+      '> - 明确只跟今天有关 → 日期记忆（`memory_append`）',
+      '> - 用户说「记住这个」→ **一定写全局记忆**',
       '',
       '系统也会在上下文压缩前提示你保存记忆。',
-    ].join('\n');
-  }
-  if (isHome) {
-    // Member home container: recall prompt with memory_search/get/append, but no global CLAUDE.md write
-    return [
-      '',
-      '## 记忆',
-      '',
-      '你拥有跨会话的持久记忆能力，请积极使用。',
-      '',
-      '### 回忆',
-      '在回答关于过去的工作、决策、日期、偏好或待办事项之前：',
-      '先用 `memory_search` 搜索，再用 `memory_get` 获取完整上下文。',
-      '',
-      '### 存储',
-      '获知重要信息（项目决策、待办、讨论要点等）时，**必须立即**调用 `memory_append` 保存。',
-      '不要等待——获知后立刻存储。',
-      '全局记忆（`/workspace/global/CLAUDE.md`）为只读，无法直接修改。',
     ].join('\n');
   }
   // Non-home group container
@@ -690,27 +678,23 @@ async function runQuery(
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
   const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
 
-  let systemPromptAppend: string;
-  if (isAdminHome) {
-    // Admin home: global CLAUDE.md is directly accessible via filesystem, only append memory recall
-    systemPromptAppend = memoryRecall;
-  } else {
-    // Member home and non-home: inject global CLAUDE.md into system prompt (read-only access)
-    let globalClaudeMd = '';
-    if (fs.existsSync(globalClaudeMdPath)) {
-      globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-    }
-    systemPromptAppend = globalClaudeMd
-      ? `${globalClaudeMd}\n${memoryRecall}`
-      : memoryRecall;
+  // Always inject global CLAUDE.md content into system prompt so the agent
+  // has memory context from the start. Home containers also get filesystem
+  // read/write access via additionalDirectories for editing.
+  let globalClaudeMd = '';
+  if (fs.existsSync(globalClaudeMdPath)) {
+    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
+  const systemPromptAppend = globalClaudeMd
+    ? `${globalClaudeMd}\n${memoryRecall}`
+    : memoryRecall;
 
   // 追踪顶层工具执行状态（用于精确发送 tool_use_end）
   let activeTopLevelToolUseId: string | null = null;
 
-  // Admin home can access global and memory directories; others only access memory
-  // (non-admin-home gets global CLAUDE.md injected via systemPromptAppend, no filesystem write needed)
-  const extraDirs = isAdminHome
+  // Home containers (admin & member) can access global and memory directories
+  // Non-home containers only access memory (global CLAUDE.md injected via systemPromptAppend)
+  const extraDirs = isHome
     ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
     : [WORKSPACE_MEMORY];
 
@@ -1064,8 +1048,9 @@ async function main(): Promise<void> {
         const today = new Date().toISOString().split('T')[0];
         const flushPrompt = [
           '上下文压缩前记忆刷新。',
-          `请使用 memory_append 将时效性记忆保存到 memory/${today}.md（项目进展、技术决策、待办事项等）。`,
-          '如果有长期不变的重要信息（用户身份、永久偏好）尚未写入全局记忆，请用 Edit 工具更新 /workspace/global/CLAUDE.md。',
+          '**优先检查全局记忆**：先 Read /workspace/global/CLAUDE.md，如果有「待记录」字段且你已获知对应信息（用户身份、偏好、常用项目等），用 Edit 工具立即填写。',
+          '用户明确要求记住的内容，以及下次对话仍可能用到的信息，也写入全局记忆。',
+          `然后使用 memory_append 将时效性记忆保存到 memory/${today}.md（今日进展、临时决策、待办等）。`,
           '如需确认上下文，可先用 memory_search/memory_get 查阅。',
           '如果没有值得保存的内容，回复一个字：OK。',
         ].join(' ');

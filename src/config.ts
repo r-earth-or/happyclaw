@@ -15,9 +15,9 @@ export const MOUNT_ALLOWLIST_PATH = path.resolve(
   'config',
   'mount-allowlist.json',
 );
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const STORE_DIR = path.join(DATA_DIR, 'db');
+export const GROUPS_DIR = path.join(DATA_DIR, 'groups');
 export const MAIN_GROUP_FOLDER = 'main';
 
 export const CONTAINER_IMAGE =
@@ -60,12 +60,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 export const SESSION_COOKIE_NAME = isProduction
   ? '__Host-happyclaw_session'
   : 'happyclaw_session';
-const SESSION_SECRET_FILE = path.resolve(
-  process.cwd(),
-  'data',
-  'config',
-  'session-secret.key',
-);
+const SESSION_SECRET_FILE = path.join(DATA_DIR, 'config', 'session-secret.key');
 
 function getOrCreateSessionSecret(): string {
   // 1. Environment variable (highest priority — allows container/operator override)

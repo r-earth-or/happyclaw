@@ -37,6 +37,7 @@ import {
   ASSISTANT_NAME,
   DATA_DIR,
   GROUPS_DIR,
+  STORE_DIR,
   IDLE_TIMEOUT,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
@@ -63,7 +64,10 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getJidsByFolder,
   getLastGroupSync,
+  getRegisteredGroup,
+  getUserById,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -276,27 +280,45 @@ function loadState(): void {
     }
   }
 
-  // Initialize global CLAUDE.md from template if missing (cold start / reset)
-  const globalDir = path.join(GROUPS_DIR, 'global');
-  const globalClaudeMdPath = path.join(globalDir, 'CLAUDE.md');
-  if (!fs.existsSync(globalClaudeMdPath)) {
-    const templatePath = path.resolve(
-      process.cwd(),
-      'config',
-      'global-claude-md.template.md',
-    );
-    if (fs.existsSync(templatePath)) {
-      try {
-        fs.mkdirSync(globalDir, { recursive: true });
-        fs.writeFileSync(globalClaudeMdPath, fs.readFileSync(templatePath, 'utf-8'), {
-          flag: 'wx',
-        });
-        logger.info('Initialized global CLAUDE.md from template');
-      } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
-          logger.warn({ err }, 'Failed to initialize global CLAUDE.md');
+  // Migrate shared global CLAUDE.md → per-user user-global directories
+  migrateGlobalMemoryToPerUser();
+
+  // Initialize per-user global CLAUDE.md from template for users missing it
+  const templatePath = path.resolve(
+    process.cwd(),
+    'config',
+    'global-claude-md.template.md',
+  );
+  if (fs.existsSync(templatePath)) {
+    const template = fs.readFileSync(templatePath, 'utf-8');
+    const userGlobalBase = path.join(GROUPS_DIR, 'user-global');
+    // Ensure every active user has a user-global dir
+    try {
+      let page = 1;
+      const allUsers: Array<{ id: string }> = [];
+      while (true) {
+        const result = listUsers({ status: 'active', page, pageSize: 200 });
+        allUsers.push(...result.users);
+        if (allUsers.length >= result.total) break;
+        page++;
+      }
+      for (const u of allUsers) {
+        const userDir = path.join(userGlobalBase, u.id);
+        fs.mkdirSync(userDir, { recursive: true });
+        const userClaudeMd = path.join(userDir, 'CLAUDE.md');
+        if (!fs.existsSync(userClaudeMd)) {
+          try {
+            fs.writeFileSync(userClaudeMd, template, { flag: 'wx' });
+            logger.info({ userId: u.id }, 'Initialized user-global CLAUDE.md from template');
+          } catch (err: unknown) {
+            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+              logger.warn({ userId: u.id, err }, 'Failed to initialize user-global CLAUDE.md');
+            }
+          }
         }
       }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to initialize user-global CLAUDE.md files');
     }
   }
 
@@ -429,10 +451,42 @@ function collectMessageImages(
  * rapid-fire messages to be piped in without spawning a new container.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  let group = registeredGroups[chatJid];
+  if (!group) {
+    // Group may have been created after loadState (e.g., during setup/registration)
+    registeredGroups = getAllRegisteredGroups();
+    group = registeredGroups[chatJid];
+  }
   if (!group) return true;
 
-  const isHome = !!group.is_home;
+  let isHome = !!group.is_home;
+
+  // IM groups (feishu/telegram) sharing a folder with a home group inherit
+  // the home group's execution mode and permissions. This ensures agents run
+  // in the correct mode (e.g., host instead of container) and have access
+  // to home-level capabilities (memory, admin privileges).
+  let effectiveGroup = group;
+  if (!isHome) {
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      const sibling = registeredGroups[jid] ?? getRegisteredGroup(jid);
+      if (sibling && !registeredGroups[jid]) {
+        registeredGroups[jid] = sibling;
+      }
+      if (sibling?.is_home) {
+        effectiveGroup = {
+          ...group,
+          executionMode: sibling.executionMode,
+          customCwd: sibling.customCwd || group.customCwd,
+          // Preserve explicit IM owner first (critical for per-user global memory).
+          created_by: group.created_by || sibling.created_by,
+          is_home: true,
+        };
+        isHome = true;
+        break;
+      }
+    }
+  }
 
   // Get all messages since last agent interaction
   const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
@@ -440,12 +494,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  const hasWebInput = missedMessages.some((m) => m.sender === 'web-user');
-  const hasFeishuInput = missedMessages.some((m) => m.sender !== 'web-user');
-  // Home groups only reply to Feishu when there's actual Feishu input
-  // (prevents Web-initiated messages from triggering Feishu replies)
-  const shouldReplyToFeishu =
-    chatJid.startsWith('feishu:') && (!isHome || hasFeishuInput);
+  // Admin home is shared as web:main, so select runtime owner from the latest
+  // active admin sender to avoid writing global memory into another admin's
+  // user-global directory.
+  if (chatJid === 'web:main' && effectiveGroup.is_home) {
+    for (let i = missedMessages.length - 1; i >= 0; i--) {
+      const sender = missedMessages[i]?.sender;
+      if (!sender || sender === 'happyclaw-agent' || sender === '__system__') continue;
+      const senderUser = getUserById(sender);
+      if (senderUser?.status === 'active' && senderUser.role === 'admin') {
+        effectiveGroup = { ...effectiveGroup, created_by: senderUser.id };
+        break;
+      }
+    }
+  }
+
+  // Reply routing: feishu JIDs reply to feishu, telegram JIDs reply to telegram.
+  // With the home-folder forced restart in the message loop, each JID gets its
+  // own processGroupMessages call, so JID-based routing is always correct.
+  const shouldReplyToFeishu = chatJid.startsWith('feishu:');
 
   const prompt = formatMessages(missedMessages);
 
@@ -456,8 +523,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     {
       group: group.name,
       messageCount: missedMessages.length,
-      hasWebInput,
-      hasFeishuInput,
       shouldReplyToFeishu,
       imageCount: images.length,
     },
@@ -496,7 +561,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   const output = await runAgent(
-    group,
+    effectiveGroup,
     prompt,
     chatJid,
     async (result) => {
@@ -1272,11 +1337,42 @@ async function startMessageLoop(): Promise<void> {
           }
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
+        // Build set of home folders: IM messages sharing a home folder must
+        // force-restart the container so reply routing is correct (e.g., feishu
+        // messages get feishu replies instead of being silently absorbed by web:main).
+        const homeFolders = new Set<string>();
+        for (const g of Object.values(registeredGroups)) {
+          if (g.is_home) homeFolders.add(g.folder);
+        }
 
-          const isHome = !!group.is_home;
+        for (const [chatJid, groupMessages] of messagesByGroup) {
+          let group = registeredGroups[chatJid];
+          if (!group) {
+            const dbGroup = getRegisteredGroup(chatJid);
+            if (dbGroup) {
+              registeredGroups[chatJid] = dbGroup;
+              group = dbGroup;
+            }
+          }
+          if (!group) continue;
+          if (group.is_home) homeFolders.add(group.folder);
+
+          // Handle cold-cache/newly-added groups: detect home folders from DB
+          // even if the in-memory map has not been fully refreshed yet.
+          if (!homeFolders.has(group.folder)) {
+            const siblingJids = getJidsByFolder(group.folder);
+            for (const siblingJid of siblingJids) {
+              const sibling =
+                registeredGroups[siblingJid] ?? getRegisteredGroup(siblingJid);
+              if (sibling && !registeredGroups[siblingJid]) {
+                registeredGroups[siblingJid] = sibling;
+              }
+              if (sibling?.is_home) {
+                homeFolders.add(group.folder);
+                break;
+              }
+            }
+          }
 
           // Pull all messages since lastAgentTimestamp to preserve full context.
           const allPending = getMessagesSince(
@@ -1286,16 +1382,14 @@ async function startMessageLoop(): Promise<void> {
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
 
-          // Home chat should always run as a fresh batch.
-          // This avoids mixing "web-only reply mode" and "reply-to-Feishu mode"
-          // inside the same long-lived container stream.
-          if (isHome) {
-            // Force current home container (if any) to wind down quickly so
-            // newly arrived Feishu/Web messages are not blocked by 30min idle hold.
+          // Groups sharing a home folder always run as a fresh batch.
+          // This prevents IM messages from being piped into an active web:main
+          // container (whose onOutput callback wouldn't route replies to IM).
+          if (homeFolders.has(group.folder)) {
             queue.closeStdin(chatJid);
             logger.debug(
               { chatJid },
-              'Home group message received, forcing stdin close before enqueue',
+              'Home-folder message received, forcing stdin close before enqueue',
             );
             queue.enqueueMessageCheck(chatJid);
             continue;
@@ -1464,8 +1558,158 @@ async function connectUserIMChannels(
   return { feishu, telegram };
 }
 
+function movePathWithFallback(src: string, dst: string): void {
+  try {
+    fs.renameSync(src, dst);
+  } catch (err: unknown) {
+    // Cross-device rename fallback.
+    if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+      fs.cpSync(src, dst, { recursive: true });
+      fs.rmSync(src, { recursive: true, force: true });
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * One-shot migration: move legacy top-level directories into data/.
+ * - store/messages.db* → data/db/messages.db*
+ * - groups/            → data/groups/
+ * Also supports partial migrations (old+new paths both exist).
+ */
+function migrateDataDirectories(): void {
+  const projectRoot = process.cwd();
+
+  // 1. Migrate store/ → data/db/
+  const oldStoreDir = path.join(projectRoot, 'store');
+  if (fs.existsSync(oldStoreDir)) {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    // Move messages.db and WAL files
+    for (const file of ['messages.db', 'messages.db-wal', 'messages.db-shm']) {
+      const src = path.join(oldStoreDir, file);
+      const dst = path.join(STORE_DIR, file);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        movePathWithFallback(src, dst);
+        logger.info({ src, dst }, 'Migrated database file');
+      }
+    }
+    // Remove old store/ if empty
+    try {
+      fs.rmdirSync(oldStoreDir);
+    } catch {
+      // Not empty — leave it
+    }
+  }
+
+  // 2. Migrate groups/ → data/groups/
+  const oldGroupsDir = path.join(projectRoot, 'groups');
+  if (fs.existsSync(oldGroupsDir)) {
+    fs.mkdirSync(path.dirname(GROUPS_DIR), { recursive: true });
+    if (!fs.existsSync(GROUPS_DIR)) {
+      movePathWithFallback(oldGroupsDir, GROUPS_DIR);
+      logger.info(
+        { src: oldGroupsDir, dst: GROUPS_DIR },
+        'Migrated groups directory',
+      );
+    } else {
+      // Partial migration: move missing entries one-by-one.
+      const entries = fs.readdirSync(oldGroupsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const src = path.join(oldGroupsDir, entry.name);
+        const dst = path.join(GROUPS_DIR, entry.name);
+        if (!fs.existsSync(dst)) {
+          movePathWithFallback(src, dst);
+          logger.info({ src, dst }, 'Migrated legacy group entry');
+        }
+      }
+      try {
+        fs.rmdirSync(oldGroupsDir);
+      } catch {
+        // Not empty — leave it
+      }
+    }
+  }
+}
+
+/**
+ * One-shot migration: copy shared global CLAUDE.md → first admin's user-global dir.
+ * Creates user-global directories for all existing users.
+ * Idempotent via flag file.
+ */
+function migrateGlobalMemoryToPerUser(): void {
+  const flagFile = path.join(DATA_DIR, 'config', '.memory-migration-v1-done');
+  if (fs.existsSync(flagFile)) return;
+
+  const oldGlobalMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+  const userGlobalBase = path.join(GROUPS_DIR, 'user-global');
+
+  let migrationSucceeded = true;
+  let copiedLegacyGlobal = !fs.existsSync(oldGlobalMd);
+
+  // Find first admin user
+  try {
+    const result = listUsers({ role: 'admin', status: 'active', page: 1, pageSize: 1 });
+    const firstAdmin = result.users[0];
+
+    if (firstAdmin && fs.existsSync(oldGlobalMd)) {
+      const adminDir = path.join(userGlobalBase, firstAdmin.id);
+      fs.mkdirSync(adminDir, { recursive: true });
+      const target = path.join(adminDir, 'CLAUDE.md');
+      if (!fs.existsSync(target)) {
+        fs.copyFileSync(oldGlobalMd, target);
+        logger.info(
+          { userId: firstAdmin.id, src: oldGlobalMd, dst: target },
+          'Migrated global CLAUDE.md to admin user-global',
+        );
+      }
+      copiedLegacyGlobal = true;
+    } else if (!firstAdmin && fs.existsSync(oldGlobalMd)) {
+      migrationSucceeded = false;
+      logger.warn(
+        'No active admin found for legacy global memory migration; will retry on next startup',
+      );
+    }
+
+    // Create user-global dirs for all users
+    let page = 1;
+    const allUsers: Array<{ id: string }> = [];
+    while (true) {
+      const r = listUsers({ status: 'active', page, pageSize: 200 });
+      allUsers.push(...r.users);
+      if (allUsers.length >= r.total) break;
+      page++;
+    }
+    for (const u of allUsers) {
+      fs.mkdirSync(path.join(userGlobalBase, u.id), { recursive: true });
+    }
+  } catch (err) {
+    migrationSucceeded = false;
+    logger.warn({ err }, 'Global memory migration encountered an error');
+  }
+
+  if (!migrationSucceeded) {
+    logger.warn('Global memory migration incomplete; will retry on next startup');
+    return;
+  }
+
+  if (!copiedLegacyGlobal) {
+    logger.warn('Legacy global memory has not been copied; will retry on next startup');
+    return;
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(flagFile), { recursive: true });
+    fs.writeFileSync(flagFile, new Date().toISOString());
+    logger.info('Global memory migration to per-user completed');
+  } catch (err) {
+    logger.warn({ err }, 'Failed to persist global memory migration flag');
+  }
+}
+
 async function main(): Promise<void> {
   validateConfig();
+  migrateDataDirectories();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -1627,6 +1871,8 @@ async function main(): Promise<void> {
     reloadUserIMConfig,
     isFeishuConnected: () => imManager.isAnyFeishuConnected(),
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
+    isUserFeishuConnected: (userId: string) => imManager.isFeishuConnected(userId),
+    isUserTelegramConnected: (userId: string) => imManager.isTelegramConnected(userId),
   });
 
   // Clean expired sessions every hour
@@ -1648,8 +1894,28 @@ async function main(): Promise<void> {
 
   queue.setProcessMessagesFn(processGroupMessages);
   queue.setHostModeChecker((groupJid: string) => {
-    const group = registeredGroups[groupJid];
-    return group?.executionMode === 'host';
+    let group = registeredGroups[groupJid];
+    if (!group) {
+      const dbGroup = getRegisteredGroup(groupJid);
+      if (dbGroup) {
+        registeredGroups[groupJid] = dbGroup;
+        group = dbGroup;
+      }
+    }
+    if (!group) return false;
+
+    if (group.is_home) return group.executionMode === 'host';
+
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      const sibling = registeredGroups[jid] ?? getRegisteredGroup(jid);
+      if (sibling && !registeredGroups[jid]) {
+        registeredGroups[jid] = sibling;
+      }
+      if (sibling?.is_home) return sibling.executionMode === 'host';
+    }
+
+    return group.executionMode === 'host';
   });
   queue.setSerializationKeyResolver((groupJid: string) => {
     const group = registeredGroups[groupJid];

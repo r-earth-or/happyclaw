@@ -74,16 +74,27 @@ function buildVolumeMounts(
   const homeDir = getHomeDir();
   const projectRoot = process.cwd();
 
-  // Global memory directory:
-  // - admin home: read-write
-  // - member home and non-home groups: read-only
-  const globalDir = path.join(GROUPS_DIR, 'global');
-  fs.mkdirSync(globalDir, { recursive: true });
-  mounts.push({
-    hostPath: globalDir,
-    containerPath: '/workspace/global',
-    readonly: !isAdminHome,
-  });
+  // Per-user global memory directory:
+  // Each user gets their own user-global/{userId}/ mounted as /workspace/global
+  const ownerId = group.created_by;
+  if (ownerId) {
+    const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+    fs.mkdirSync(userGlobalDir, { recursive: true });
+    mounts.push({
+      hostPath: userGlobalDir,
+      containerPath: '/workspace/global',
+      readonly: !group.is_home,
+    });
+  } else {
+    // Legacy fallback for rows without created_by.
+    const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+    fs.mkdirSync(legacyGlobalDir, { recursive: true });
+    mounts.push({
+      hostPath: legacyGlobalDir,
+      containerPath: '/workspace/global',
+      readonly: !isAdminHome,
+    });
+  }
 
   if (isAdminHome) {
     // Admin home gets the entire project root mounted
@@ -943,7 +954,17 @@ export async function runHostAgent(
 
   // 路径映射
   hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
-  hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = path.join(GROUPS_DIR, 'global');
+  // Per-user global memory
+  const ownerId = group.created_by;
+  if (ownerId) {
+    const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+    fs.mkdirSync(userGlobalDir, { recursive: true });
+    hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
+  } else {
+    const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+    fs.mkdirSync(legacyGlobalDir, { recursive: true });
+    hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
+  }
   hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(DATA_DIR, 'memory', group.folder);
   hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
   hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;

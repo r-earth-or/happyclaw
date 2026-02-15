@@ -226,7 +226,7 @@ export function CreateContainerDialog({
                 {/* Host mode: custom cwd */}
                 {executionMode === 'host' && (
                   <>
-                    <DirectoryBrowser value={customCwd} onChange={setCustomCwd} placeholder="默认: groups/{folder}/" />
+                    <DirectoryBrowser value={customCwd} onChange={setCustomCwd} placeholder="默认: data/groups/{folder}/" />
                     <div className="flex items-start gap-2 p-2 bg-amber-50 border border-amber-200 rounded-lg">
                       <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
                       <p className="text-xs text-amber-700">

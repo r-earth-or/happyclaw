@@ -156,9 +156,9 @@ StreamEvent 类型在三处定义，**必须保持同步**：
 
 | 资源 | 容器路径 | admin 主容器 | member 主容器/其他 |
 |------|---------|-------------|-------------------|
-| 工作目录 `groups/{folder}/` | `/workspace/group` | 读写 | 读写（仅自己） |
+| 工作目录 `data/groups/{folder}/` | `/workspace/group` | 读写 | 读写（仅自己） |
 | 项目根目录 | `/workspace/project` | 读写 | 不可访问 |
-| 全局记忆 `groups/global/` | `/workspace/global` | 读写 | 只读 |
+| 用户全局记忆 `data/groups/user-global/{userId}/` | `/workspace/global` | 读写 | 读写（仅自己） |
 | Claude 会话 `data/sessions/{folder}/.claude/` | `/home/node/.claude` | 读写 | 读写（仅自己） |
 | IPC 通道 `data/ipc/{folder}/` | `/workspace/ipc` | 读写 | 读写（仅自己） |
 | 项目级 Skills `container/skills/` | `/workspace/project-skills` | 只读 | 只读 |
@@ -276,38 +276,38 @@ SQLite WAL 模式，Schema 经历 v1→v13 演进（`db.ts` 中的 `SCHEMA_VERSI
 
 ## 6. 目录约定
 
+所有运行时数据统一在 `data/` 目录下，启动时自动创建（`mkdirSync recursive`），无需手动初始化。旧版 `store/` 和 `groups/` 目录在首次启动时自动迁移到 `data/` 下。
+
 ```
-groups/{folder}/              # 会话工作目录（Agent 可读写）
-groups/{folder}/CLAUDE.md     # 会话私有记忆（Agent 自动维护）
-groups/{folder}/logs/         # Agent 容器日志
-groups/{folder}/conversations/ # 对话归档（PreCompact Hook 写入）
-groups/global/                # 全局共享目录
-groups/global/CLAUDE.md       # 全局记忆（所有会话可见，Agent 自动维护）
-
-data/sessions/{folder}/.claude/  # Claude 会话持久化（隔离）
-data/ipc/{folder}/input/         # IPC 输入通道
-data/ipc/{folder}/messages/      # IPC 消息输出
-data/ipc/{folder}/tasks/         # IPC 任务管理
-data/env/{folder}/env            # 容器环境变量文件
-data/config/                     # 加密配置文件
-data/config/claude-provider.json     # Claude API 配置
-data/config/feishu-provider.json     # 飞书配置
-data/config/claude-custom-env.json   # 自定义环境变量
-data/config/container-env/{folder}.json  # 群组级环境变量覆盖
-data/config/user-im/{userId}/feishu.json    # 用户级飞书 IM 配置（AES-256-GCM 加密）
-data/config/user-im/{userId}/telegram.json  # 用户级 Telegram IM 配置（AES-256-GCM 加密）
-data/config/registration.json    # 注册设置（开关、邀请码要求）
-data/config/session-secret.key   # 会话签名密钥（0600 权限）
-
-store/messages.db             # SQLite 数据库（WAL 模式）
+data/
+  db/messages.db                           # SQLite 数据库（WAL 模式）
+  groups/{folder}/                         # 会话工作目录（Agent 可读写）
+  groups/{folder}/CLAUDE.md                # 会话私有记忆（Agent 自动维护）
+  groups/{folder}/logs/                    # Agent 容器日志
+  groups/{folder}/conversations/           # 对话归档（PreCompact Hook 写入）
+  groups/user-global/{userId}/             # 用户级全局记忆目录
+  groups/user-global/{userId}/CLAUDE.md    # 用户全局记忆（Agent 自动维护，per-user 隔离）
+  sessions/{folder}/.claude/               # Claude 会话持久化（隔离）
+  ipc/{folder}/input/                      # IPC 输入通道
+  ipc/{folder}/messages/                   # IPC 消息输出
+  ipc/{folder}/tasks/                      # IPC 任务管理
+  env/{folder}/env                         # 容器环境变量文件
+  memory/{folder}/                         # 日期记忆
+  config/                                  # 加密配置文件
+  config/claude-provider.json              # Claude API 配置
+  config/feishu-provider.json              # 飞书配置
+  config/claude-custom-env.json            # 自定义环境变量
+  config/container-env/{folder}.json       # 群组级环境变量覆盖
+  config/user-im/{userId}/feishu.json      # 用户级飞书 IM 配置（AES-256-GCM 加密）
+  config/user-im/{userId}/telegram.json    # 用户级 Telegram IM 配置（AES-256-GCM 加密）
+  config/registration.json                 # 注册设置（开关、邀请码要求）
+  config/session-secret.key                # 会话签名密钥（0600 权限）
 
 config/default-groups.json    # 预注册群组配置
 config/mount-allowlist.json   # 容器挂载白名单
 
 container/skills/             # 项目级 Skills（挂载到所有容器）
 ```
-
-所有 `groups/`、`data/`、`store/` 目录在启动时自动创建（`mkdirSync recursive`），无需手动初始化。
 
 ## 7. Web API
 

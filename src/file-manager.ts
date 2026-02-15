@@ -6,7 +6,7 @@ import { logger } from './logger.js';
 // 类型
 export interface FileEntry {
   name: string;
-  path: string; // 相对于 groups/{folder}/ 的路径
+  path: string; // 相对于 data/groups/{folder}/ 的路径
   type: 'file' | 'directory';
   size: number;
   modifiedAt: string;

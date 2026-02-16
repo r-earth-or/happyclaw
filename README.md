@@ -499,13 +499,7 @@ Commit message 使用简体中文，格式：`类型: 描述`
 
 ## Star History
 
-<a href="https://star-history.com/#riba2534/happyclaw&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=riba2534/happyclaw&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=riba2534/happyclaw&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=riba2534/happyclaw&type=Date" />
-  </picture>
-</a>
+[![Star History Chart](https://api.star-history.com/svg?repos=riba2534/happyclaw&type=date&legend=top-left)](https://www.star-history.com/#riba2534/happyclaw&type=date&legend=top-left)
 
 ## 许可证
 

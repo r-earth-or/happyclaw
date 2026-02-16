@@ -615,7 +615,17 @@ function setupWebSocket(server: any): WebSocketServer {
  * If adminOnly is true, only send to clients whose session belongs to an admin user.
  * If ownerUserId is provided, only send to that user and admins (for group isolation).
  */
-function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: string): void {
+/**
+ * Broadcast a WebSocket message with access control filtering.
+ *
+ * @param msg - The message to broadcast
+ * @param adminOnly - If true, only admin users receive the message
+ * @param ownerUserId - Group owner filtering:
+ *   - undefined: no user-level filtering (e.g. system-wide admin broadcasts)
+ *   - null: ownership unresolvable → default-deny, only admin can see
+ *   - string: only this owner + admin can see
+ */
+function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: string | null): void {
   const data = JSON.stringify(msg);
   for (const [client, clientInfo] of wsClients) {
     if (client.readyState !== WebSocket.OPEN) {
@@ -659,8 +669,11 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
     }
 
     // Group isolation: only owner and admins can see this group's events
-    if (ownerUserId && session.role !== 'admin' && session.user_id !== ownerUserId) {
-      continue;
+    // ownerUserId === null means ownership unresolvable → default-deny (admin-only)
+    if (ownerUserId !== undefined && session.role !== 'admin') {
+      if (ownerUserId === null || session.user_id !== ownerUserId) {
+        continue;
+      }
     }
 
     try {
@@ -675,10 +688,15 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
  * Get the owner userId for broadcast filtering.
  * For any group with created_by, return that owner.
  * For legacy IM groups missing created_by, try resolving owner from sibling home group.
+ *
+ * Returns:
+ * - string: resolved owner userId → only owner + admin can see
+ * - null: ownership unresolvable → default-deny (admin-only)
+ * - undefined is NOT returned; callers receive string | null
  */
-function getGroupOwnerUserId(chatJid: string): string | undefined {
+function getGroupOwnerUserId(chatJid: string): string | null {
   const group = getRegisteredGroup(chatJid);
-  if (!group) return undefined;
+  if (!group) return null; // Unknown group → deny by default
 
   if (group.created_by) return group.created_by;
 
@@ -692,12 +710,12 @@ function getGroupOwnerUserId(chatJid: string): string | undefined {
         return siblingGroup.created_by;
       }
     }
-    return undefined;
+    return null; // Unresolvable legacy IM group → deny by default
   }
 
-  if (group.is_home) return group.created_by ?? undefined;
-  if (group.folder === 'main') return undefined; // Legacy main session visible to all
-  return group.created_by ?? undefined;
+  if (group.is_home) return group.created_by ?? null;
+  if (group.folder === 'main') return null; // admin's host group, adminOnly handles it
+  return group.created_by ?? null; // Legacy web group without owner → deny by default
 }
 
 /** Check if a chatJid belongs to a host-mode group (for broadcast filtering) */
@@ -774,16 +792,15 @@ function broadcastStatus(): void {
   if (!deps) return;
 
   const queueStatus = deps.queue.getStatus();
-  // Only broadcast container-level stats to all clients.
-  // Host-specific metrics (activeHostProcesses, activeTotal) are admin-only,
-  // available via REST /api/status with proper permission filtering.
+  // Broadcast aggregate system metrics only to admin users.
+  // Non-admin users get per-user filtered metrics via REST /api/status.
   safeBroadcast({
     type: 'status_update',
     activeContainers: queueStatus.activeContainerCount,
-    activeHostProcesses: 0,
-    activeTotal: queueStatus.activeContainerCount,
+    activeHostProcesses: queueStatus.activeHostProcessCount,
+    activeTotal: queueStatus.activeCount,
     queueLength: queueStatus.waitingCount,
-  });
+  }, /* adminOnly */ true);
 }
 
 // --- Server Startup ---

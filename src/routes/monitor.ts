@@ -99,13 +99,31 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
 
   const dockerImageExists = await checkDockerImageExists();
 
+  // For non-admin users, derive aggregate metrics from their own filtered groups only
+  // to prevent leaking global system load information across users
+  let activeContainers: number;
+  let queueLength: number;
+  if (isAdmin) {
+    activeContainers = queueStatus.activeContainerCount;
+    queueLength = queueStatus.waitingCount;
+  } else {
+    activeContainers = filteredGroups.filter((g) => g.active).length;
+    // Filter waiting groups by user ownership
+    queueLength = queueStatus.waitingGroupJids.filter((jid) => {
+      const group = getRegisteredGroup(jid);
+      if (!group) return false;
+      if (isHostExecutionGroup(group)) return false;
+      return canAccessGroup({ id: authUser.id, role: authUser.role }, group);
+    }).length;
+  }
+
   return c.json({
-    activeContainers: queueStatus.activeContainerCount,
+    activeContainers,
     activeHostProcesses: isAdmin ? queueStatus.activeHostProcessCount : undefined,
-    activeTotal: isAdmin ? queueStatus.activeCount : queueStatus.activeContainerCount,
+    activeTotal: isAdmin ? queueStatus.activeCount : activeContainers,
     maxConcurrentContainers: MAX_CONCURRENT_CONTAINERS,
     maxConcurrentHostProcesses: isAdmin ? MAX_CONCURRENT_HOST_PROCESSES : undefined,
-    queueLength: queueStatus.waitingCount,
+    queueLength,
     uptime: Math.floor(process.uptime()),
     groups: filteredGroups,
     dockerImageExists,

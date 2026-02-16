@@ -686,6 +686,7 @@ export class GroupQueue {
     activeContainerCount: number;
     activeHostProcessCount: number;
     waitingCount: number;
+    waitingGroupJids: string[];
     groups: Array<{
       jid: string;
       active: boolean;
@@ -720,6 +721,7 @@ export class GroupQueue {
       activeContainerCount: this.activeContainerCount,
       activeHostProcessCount: this.activeHostProcessCount,
       waitingCount: this.waitingGroups.size,
+      waitingGroupJids: Array.from(this.waitingGroups),
       groups,
     };
   }

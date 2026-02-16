@@ -57,14 +57,7 @@ export function App() {
           <Route path="/groups" element={<Navigate to="/settings?tab=groups" replace />} />
           <Route path="/tasks" element={<Suspense fallback={null}><TasksPage /></Suspense>} />
           <Route path="/monitor" element={<Suspense fallback={null}><MonitorPage /></Suspense>} />
-          <Route
-            path="/memory"
-            element={
-              <AuthGuard requiredPermission="manage_system_config">
-                <MemoryPage />
-              </AuthGuard>
-            }
-          />
+          <Route path="/memory" element={<MemoryPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/settings" element={<Suspense fallback={null}><SettingsPage /></Suspense>} />
           <Route

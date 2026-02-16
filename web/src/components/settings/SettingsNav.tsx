@@ -62,7 +62,6 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
   visibleItems.push({ group: '账户设置', items: accountItems });
 
   const visibleFeatures = featureItems.filter((item) => {
-    if (item.key === 'memory' && !canManageSystemConfig) return false;
     if (item.key === 'users' && !canManageUsers) return false;
     return true;
   });

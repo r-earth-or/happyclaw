@@ -9,6 +9,7 @@ import type { AuthUser } from '../types.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
+  canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
 import { getRegisteredGroup, getRouterState } from '../db.js';
@@ -86,12 +87,14 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
   const isAdmin = hasHostExecutionPermission(authUser);
   const queueStatus = deps.queue.getStatus();
 
-  // Filter host-mode groups from status for non-admin users
+  // Filter groups for non-admin users: only show groups they own, exclude host-mode
   const filteredGroups = isAdmin
     ? queueStatus.groups
     : queueStatus.groups.filter((g) => {
         const group = getRegisteredGroup(g.jid);
-        return !group || !isHostExecutionGroup(group);
+        if (!group) return false;
+        if (isHostExecutionGroup(group)) return false;
+        return canAccessGroup({ id: authUser.id, role: authUser.role }, group);
       });
 
   const dockerImageExists = await checkDockerImageExists();

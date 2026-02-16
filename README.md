@@ -21,25 +21,33 @@
 
 ---
 
-<!-- Hero 截图：聊天界面，展示流式思考 + 工具调用 -->
-<!-- <p align="center">
-  <img src="docs/screenshots/chat-desktop.png" alt="聊天界面 — 流式显示思考过程与工具调用" width="80%" />
-</p> -->
+| 聊天界面 — 工具调用追踪 | 聊天界面 — Markdown 渲染 | 聊天界面 — 图片生成 + 文件管理 |
+|:--------------------:|:-------------------:|:----------------------:|
+| <img src="docs/screenshots/chat-tool-tracking.png" width="280" /> | <img src="docs/screenshots/chat-markdown.png" width="280" /> | <img src="docs/screenshots/chat-image-gen.png" width="280" /> |
 
-<!-- 更多截图（取消注释并替换为实际截图后展示）
 <details>
 <summary>📸 更多截图</summary>
+<br/>
 
-| 移动端 PWA | 设置向导 | 系统监控 |
-|:---------:|:-------:|:-------:|
-| <img src="docs/screenshots/chat-mobile.png" width="250" /> | <img src="docs/screenshots/setup-wizard.png" width="250" /> | <img src="docs/screenshots/monitor.png" width="250" /> |
+**设置向导**
 
-| 飞书卡片消息 | Web Terminal | 记忆管理 |
-|:-----------:|:-----------:|:-------:|
-| <img src="docs/screenshots/feishu-card.png" width="250" /> | <img src="docs/screenshots/web-terminal.png" width="250" /> | <img src="docs/screenshots/memory.png" width="250" /> |
+| 创建管理员 | 配置接入（飞书 + Claude） |
+|:--------:|:---------------------:|
+| <img src="docs/screenshots/setup-wizard.png" width="400" /> | <img src="docs/screenshots/setup-providers.png" width="400" /> |
+
+**移动端 PWA**
+
+| 登录 | 工作区 | 系统监控 | 设置 |
+|:---:|:-----:|:------:|:---:|
+| <img src="docs/screenshots/mobile-login.png" width="180" /> | <img src="docs/screenshots/mobile-groups.png" width="180" /> | <img src="docs/screenshots/mobile-monitor.png" width="180" /> | <img src="docs/screenshots/mobile-settings.png" width="180" /> |
+
+**飞书集成**
+
+| Bot 聊天 | 富文本卡片回复 |
+|:-------:|:----------:|
+| <img src="docs/screenshots/feishu-chat.png" width="280" /> | <img src="docs/screenshots/feishu-card-reply.png" width="280" /> |
 
 </details>
--->
 
 ## HappyClaw 是什么
 
@@ -68,7 +76,6 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 
 每个用户可独立配置自己的 IM 通道（飞书应用凭据、Telegram Bot Token），互不干扰。消息统一路由：飞书来源回飞书，Telegram 来源回 Telegram，Web 来源回 Web。
 
-<!-- 截图插入点: 多渠道消息界面 -->
 
 ### Agent 执行引擎
 
@@ -81,7 +88,6 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 - **自定义工作目录** — 每个会话可配置 `customCwd` 指向不同项目
 - **失败自动恢复** — 指数退避重试（5s → 80s，最多 5 次），上下文溢出自动压缩并归档历史
 
-<!-- 截图插入点: 会话管理页面 -->
 
 ### 实时流式体验
 
@@ -93,7 +99,6 @@ Agent 的思考和执行过程实时推送到前端，而非等待最终结果�
 - **Hook 执行状态** — PreToolUse / PostToolUse Hook 的启动、进度、结果
 - **流式 Markdown 渲染** — GFM 表格、代码高亮、图片 Lightbox
 
-<!-- 截图插入点: 流式思考 + 工具调用界面 -->
 
 ### 10 个 MCP 工具
 
@@ -116,7 +121,6 @@ Agent 在运行时可通过内置 MCP Server 与主进程通信：
 - 两种上下文模式：`group`（在指定会话中执行）/ `isolated`（独立隔离环境）
 - 完整的执行日志（耗时、状态、结果），Web 界面管理
 
-<!-- 截图插入点: 定时任务管理页面 -->
 
 ### 记忆系统
 
@@ -128,7 +132,6 @@ Agent 自主维护跨会话的持久记忆：
 - **对话归档** — PreCompact Hook 在上下文压缩前自动归档到 `conversations/`
 - **全文检索** — Web 界面在线编辑 + 搜索
 
-<!-- 截图插入点: 记忆管理页面 -->
 
 ### Skills 系统
 
@@ -140,7 +143,6 @@ Agent 自主维护跨会话的持久记忆：
 
 基于 xterm.js + node-pty 的完整终端：WebSocket 连接，可拖拽调整面板，直接在 Web 界面中操作服务器。
 
-<!-- 截图插入点: Web Terminal -->
 
 ### 移动端 PWA
 
@@ -151,7 +153,6 @@ Agent 自主维护跨会话的持久记忆：
 - **iOS / Android 适配** — 安全区域适配、滚动优化、字体渲染、触摸交互
 - **随时可用** — 任何时间、任何地点，掏出手机就能与 AI Agent 对话、查看执行状态、管理任务
 
-<!-- 截图插入点: 移动端 PWA 安装 + 使用界面 -->
 
 ### 文件管理
 
@@ -223,7 +224,6 @@ make start
 
 > 所有配置通过 Web 界面完成，无需手动编辑 `.env` 文件。API 密钥 AES-256-GCM 加密存储。
 
-<!-- 截图插入点: 设置向导流程 -->
 
 ### 启用容器模式
 
@@ -246,7 +246,6 @@ admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如�
 
 每个用户可在个人设置中独立配置飞书应用凭据，实现 per-user 的飞书 Bot。
 
-<!-- 截图插入点: 飞书配置页面 -->
 
 ### 配置 Telegram 集成
 
@@ -254,7 +253,6 @@ admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如�
 2. 记录返回的 Bot Token
 3. 在 HappyClaw Web 界面的「设置 → IM 通道 → Telegram」中填入 Bot Token
 
-<!-- 截图插入点: Telegram 配置页面 -->
 
 ### 执行模式
 

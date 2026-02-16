@@ -1521,10 +1521,36 @@ async function ensureDockerRunning(): Promise<void> {
 /**
  * Build the onNewChat callback for IM connections.
  * Feishu/Telegram chats auto-register to the user's home group folder.
+ *
+ * When the same Feishu app is transferred between users (e.g., admin disables
+ * their channel and a member enables the same credentials), existing chats
+ * are re-routed to the new user's home folder on first message receipt.
  */
 function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, chatName: string) => void {
   return (chatJid, chatName) => {
-    if (registeredGroups[chatJid]) return;
+    const existing = registeredGroups[chatJid];
+    if (existing) {
+      // Already owned by this user — nothing to do
+      if (existing.created_by === userId) return;
+
+      // Different user's connection now owns this IM app.
+      // Re-route the chat to the current user's home folder.
+      // This handles the common case where the same Feishu app credentials
+      // are moved from one user to another (e.g., admin → member for testing).
+      if (!existing.is_home) {
+        const previousFolder = existing.folder;
+        const previousOwner = existing.created_by;
+        existing.folder = homeFolder;
+        existing.created_by = userId;
+        setRegisteredGroup(chatJid, existing);
+        registeredGroups[chatJid] = existing;
+        logger.info(
+          { chatJid, chatName, userId, homeFolder, previousFolder, previousOwner },
+          'Re-routed IM chat to new user (IM credentials transferred)',
+        );
+      }
+      return;
+    }
     registerGroup(chatJid, {
       name: chatName,
       folder: homeFolder,

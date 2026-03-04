@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { Loader2, Upload, Trash2 } from 'lucide-react';
+import { Loader2, Upload, Trash2, Link, Unlink } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 
 import { useAuthStore } from '../../stores/auth';
+import { api } from '../../api/client';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { EmojiAvatar } from '@/components/common/EmojiAvatar';
@@ -13,7 +15,13 @@ import { getErrorMessage } from './types';
 interface ProfileSectionProps extends SettingsNotification {}
 
 export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
-  const { user: currentUser, changePassword, updateProfile, uploadAvatar } = useAuthStore();
+  const { user: currentUser, changePassword, updateProfile, uploadAvatar, unbindFeishu } = useAuthStore();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Feishu bind state
+  const [feishuBinding, setFeishuBinding] = useState(false);
+  const [feishuUnbinding, setFeishuUnbinding] = useState(false);
+  const [feishuError, setFeishuError] = useState<string | null>(null);
 
   // Profile
   const [username, setUsername] = useState('');
@@ -47,6 +55,43 @@ export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
     setAiAvatarUrl(currentUser?.ai_avatar_url ?? null);
   }, [currentUser?.username, currentUser?.display_name, currentUser?.avatar_emoji, currentUser?.avatar_color, currentUser?.ai_name, currentUser?.ai_avatar_emoji, currentUser?.ai_avatar_color, currentUser?.ai_avatar_url]);
 
+  // Handle OAuth callback result from Feishu bind redirect
+  useEffect(() => {
+    const result = searchParams.get('feishu_bind');
+    if (result === 'success') {
+      setNotice('飞书账号绑定成功');
+      setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete('feishu_bind'); return next; }, { replace: true });
+    } else if (result === 'conflict') {
+      setFeishuError('该飞书账号已绑定其他用户');
+      setSearchParams((prev) => { const next = new URLSearchParams(prev); next.delete('feishu_bind'); return next; }, { replace: true });
+    }
+  }, [searchParams, setSearchParams, setNotice, setError]);
+
+  const handleBindFeishu = async () => {
+    setFeishuBinding(true);
+    setFeishuError(null);
+    try {
+      const data = await api.get<{ authorizeUrl: string }>('/api/auth/feishu/bind-authorize');
+      window.location.href = data.authorizeUrl;
+    } catch (err) {
+      setFeishuError(getErrorMessage(err, '获取飞书授权链接失败'));
+      setFeishuBinding(false);
+    }
+  };
+
+  const handleUnbindFeishu = async () => {
+    setFeishuUnbinding(true);
+    setFeishuError(null);
+    try {
+      await unbindFeishu();
+      setNotice('飞书账号已解绑');
+    } catch (err) {
+      setFeishuError(getErrorMessage(err, '解绑飞书账号失败'));
+    } finally {
+      setFeishuUnbinding(false);
+    }
+  };
+
   const handleUpdateProfile = async () => {
     setProfileSaving(true);
     setError(null);
@@ -71,10 +116,10 @@ export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
     setError(null);
     setNotice(null);
     try {
-      await changePassword(currentPwd, newPwd);
+      await changePassword(currentUser?.has_password ? currentPwd : null, newPwd);
       setCurrentPwd('');
       setNewPwd('');
-      setNotice('密码已修改');
+      setNotice(currentUser?.has_password ? '密码已修改' : '密码已设置');
     } catch (err) {
       setError(getErrorMessage(err, '修改密码失败'));
     } finally {
@@ -301,18 +346,63 @@ export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
       {/* Divider */}
       <div className="border-t border-slate-200" />
 
+      {/* Feishu Binding */}
+      <div>
+        <h3 className="text-base font-semibold text-slate-900 mb-3">飞书账号</h3>
+        {currentUser?.feishu_open_id ? (
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 text-sm text-slate-600 bg-green-50 border border-green-200 rounded-lg px-3 py-2">
+                <Link className="size-4 text-green-500 shrink-0" />
+                <span>已绑定飞书账号</span>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleUnbindFeishu}
+                disabled={feishuUnbinding}
+              >
+                {feishuUnbinding ? <Loader2 className="size-4 animate-spin" /> : <Unlink className="size-4" />}
+                解绑
+              </Button>
+            </div>
+            {feishuError && <p className="text-xs text-red-500">{feishuError}</p>}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <Button
+              variant="outline"
+              onClick={handleBindFeishu}
+              disabled={feishuBinding}
+            >
+              {feishuBinding ? <Loader2 className="size-4 animate-spin" /> : <Link className="size-4" />}
+              绑定飞书账号
+            </Button>
+            {feishuError && <p className="text-xs text-red-500">{feishuError}</p>}
+            <p className="text-xs text-slate-400">
+              绑定后可使用飞书扫码登录
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Divider */}
+      <div className="border-t border-slate-200" />
+
       {/* Change Password */}
       <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">修改密码</h3>
+        <h3 className="text-base font-semibold text-slate-900 mb-4">{currentUser?.has_password ? '修改密码' : '设置密码'}</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs text-slate-600 mb-1">当前密码</label>
-            <Input
-              type="password"
-              value={currentPwd}
-              onChange={(e) => setCurrentPwd(e.target.value)}
-            />
-          </div>
+          {currentUser?.has_password && (
+            <div>
+              <label className="block text-xs text-slate-600 mb-1">当前密码</label>
+              <Input
+                type="password"
+                value={currentPwd}
+                onChange={(e) => setCurrentPwd(e.target.value)}
+              />
+            </div>
+          )}
           <div>
             <label className="block text-xs text-slate-600 mb-1">新密码</label>
             <Input
@@ -324,9 +414,9 @@ export function ProfileSection({ setNotice, setError }: ProfileSectionProps) {
           </div>
         </div>
         <div className="mt-4">
-          <Button onClick={handleChangePassword} disabled={pwdChanging || !currentPwd || !newPwd}>
+          <Button onClick={handleChangePassword} disabled={pwdChanging || (currentUser?.has_password ? !currentPwd : false) || !newPwd}>
             {pwdChanging && <Loader2 className="size-4 animate-spin" />}
-            修改密码
+            {currentUser?.has_password ? '修改密码' : '设置密码'}
           </Button>
         </div>
       </div>

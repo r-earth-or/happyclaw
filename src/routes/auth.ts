@@ -21,6 +21,7 @@ import {
   getUserByUsername,
   getUserById,
   findOrCreateUserByFeishuOpenId,
+  getUserByFeishuOpenId,
   createInitialAdminUser,
   createUserSession,
   deleteUserSession,
@@ -84,6 +85,8 @@ export function toUserPublic(u: User): UserPublic {
     id: u.id,
     username: u.username,
     display_name: u.display_name,
+    feishu_open_id: u.feishu_open_id ?? null,
+    has_password: !!u.password_hash,
     role: u.role,
     status: u.status,
     permissions: u.permissions,
@@ -124,7 +127,7 @@ function buildSetupStatus() {
 const FEISHU_OAUTH_FLOW_TTL_MS = 10 * 60 * 1000;
 const FEISHU_OAUTH_BASE_URL = 'https://open.feishu.cn';
 const FEISHU_AUTHORIZE_PATH = '/open-apis/authen/v1/index';
-const feishuOauthFlows = new Map<string, { expiresAt: number }>();
+const feishuOauthFlows = new Map<string, { expiresAt: number; bindUserId?: string }>();
 
 const feishuOauthCleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -289,6 +292,32 @@ authRoutes.get('/feishu/authorize', (c) => {
   });
 });
 
+// Initiate Feishu bind for an already-logged-in user
+authRoutes.get('/feishu/bind-authorize', authMiddleware, (c) => {
+  const config = getFeishuProviderConfig();
+  if (!config.appId || !config.appSecret) {
+    return c.json({ error: 'Feishu OAuth is not configured' }, 400);
+  }
+
+  const user = c.get('user') as AuthUser;
+  const callbackUrl = getAppUrl(c.req.url, '/api/auth/feishu/callback');
+  const state = crypto.randomBytes(16).toString('hex');
+  feishuOauthFlows.set(state, {
+    expiresAt: Date.now() + FEISHU_OAUTH_FLOW_TTL_MS,
+    bindUserId: user.id,
+  });
+
+  const params = new URLSearchParams({
+    app_id: config.appId,
+    redirect_uri: callbackUrl,
+    state,
+  });
+
+  return c.json({
+    authorizeUrl: `${FEISHU_OAUTH_BASE_URL}${FEISHU_AUTHORIZE_PATH}?${params.toString()}`,
+  });
+});
+
 authRoutes.get('/feishu/callback', async (c) => {
   const validation = FeishuOAuthCallbackSchema.safeParse({
     code: c.req.query('code'),
@@ -351,6 +380,37 @@ authRoutes.get('/feishu/callback', async (c) => {
 
     const ip = getClientIp(c);
     const ua = c.req.header('user-agent') || null;
+
+    // ── Bind mode: link Feishu open_id to an existing logged-in user ──
+    if (flow.bindUserId) {
+      const targetUser = getUserById(flow.bindUserId);
+      if (!targetUser) {
+        return redirectToLoginWithError(c, '绑定失败：用户不存在');
+      }
+      // Check if this open_id is already bound to another account
+      const existing = getUserByFeishuOpenId(openId);
+      if (existing && existing.id !== flow.bindUserId) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: getAppUrl(c.req.url, '/settings?feishu_bind=conflict') },
+        });
+      }
+      updateUserFields(flow.bindUserId, { feishu_open_id: openId });
+      logAuthEvent({
+        event_type: 'profile_updated',
+        username: targetUser.username,
+        ip_address: ip,
+        user_agent: ua,
+        details: { fields: ['feishu_open_id'], action: 'bind' },
+      });
+      logger.info({ userId: flow.bindUserId, openId }, 'Feishu account bound');
+      return new Response(null, {
+        status: 302,
+        headers: { Location: getAppUrl(c.req.url, '/settings?feishu_bind=success') },
+      });
+    }
+
+    // ── Login mode ──
     const { user, created } = findOrCreateUserByFeishuOpenId({
       openId,
       displayName,
@@ -825,17 +885,26 @@ authRoutes.put('/password', authMiddleware, async (c) => {
   const fullUser = getUserById(user.id);
   if (!fullUser) return c.json({ error: 'User not found' }, 404);
 
-  const match = await verifyPassword(
-    validation.data.current_password,
-    fullUser.password_hash,
-  );
-  if (!match) return c.json({ error: 'Current password is incorrect' }, 401);
-  if (validation.data.current_password === validation.data.new_password) {
-    return c.json(
-      { error: 'New password must be different from current password' },
-      400,
+  const hasPassword = !!fullUser.password_hash;
+
+  if (hasPassword) {
+    // Normal account: current_password is required
+    if (!validation.data.current_password) {
+      return c.json({ error: 'Current password is required' }, 400);
+    }
+    const match = await verifyPassword(
+      validation.data.current_password,
+      fullUser.password_hash,
     );
+    if (!match) return c.json({ error: 'Current password is incorrect' }, 401);
+    if (validation.data.current_password === validation.data.new_password) {
+      return c.json(
+        { error: 'New password must be different from current password' },
+        400,
+      );
+    }
   }
+  // Feishu-only account (no password): skip current_password check
 
   const passwordError = validatePassword(validation.data.new_password);
   if (passwordError) return c.json({ error: passwordError }, 400);
@@ -1012,6 +1081,34 @@ authRoutes.get('/avatars/:filename', async (c) => {
       'Cache-Control': 'public, max-age=31536000, immutable',
     },
   });
+});
+
+// Unbind Feishu account from current user
+authRoutes.post('/feishu/unbind', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const fullUser = getUserById(user.id);
+  if (!fullUser) return c.json({ error: 'User not found' }, 404);
+
+  if (!fullUser.feishu_open_id) {
+    return c.json({ error: '当前账号未绑定飞书' }, 400);
+  }
+
+  // Prevent unbind if this is a Feishu-only account (no password set)
+  if (!fullUser.password_hash) {
+    return c.json({ error: '飞书注册账号无法解绑，请先设置密码' }, 400);
+  }
+
+  updateUserFields(user.id, { feishu_open_id: null });
+  logAuthEvent({
+    event_type: 'profile_updated',
+    username: fullUser.username,
+    ip_address: getClientIp(c),
+    details: { fields: ['feishu_open_id'], action: 'unbind' },
+  });
+  logger.info({ userId: user.id }, 'Feishu account unbound');
+
+  const updated = getUserById(user.id)!;
+  return c.json({ success: true, user: toUserPublic(updated) });
 });
 
 export default authRoutes;

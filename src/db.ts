@@ -1491,6 +1491,8 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     id: user.id,
     username: user.username,
     display_name: user.display_name,
+    feishu_open_id: user.feishu_open_id,
+    has_password: !!user.password_hash,
     role: user.role,
     status: user.status,
     permissions: user.permissions,
@@ -1683,6 +1685,7 @@ export function findOrCreateUserByFeishuOpenId(input: {
         display_name: params.displayName || username,
         role,
         status: 'active',
+        must_change_password: true,
         notes: 'Auto-created from Feishu',
         created_at: now,
         updated_at: now,
@@ -1827,6 +1830,7 @@ export function updateUserFields(
       | 'notes'
       | 'avatar_emoji'
       | 'avatar_color'
+      | 'feishu_open_id'
       | 'ai_name'
       | 'ai_avatar_emoji'
       | 'ai_avatar_color'
@@ -1885,6 +1889,10 @@ export function updateUserFields(
   if (updates.avatar_color !== undefined) {
     fields.push('avatar_color = ?');
     values.push(updates.avatar_color);
+  }
+  if (updates.feishu_open_id !== undefined) {
+    fields.push('feishu_open_id = ?');
+    values.push(updates.feishu_open_id);
   }
   if (updates.ai_name !== undefined) {
     fields.push('ai_name = ?');

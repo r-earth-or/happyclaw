@@ -12,6 +12,8 @@ export interface UserPublic {
   id: string;
   username: string;
   display_name: string;
+  feishu_open_id: string | null;
+  has_password: boolean;
   role: 'admin' | 'member';
   status: 'active' | 'disabled' | 'deleted';
   permissions: Permission[];
@@ -56,11 +58,12 @@ interface AuthState {
   checkAuth: () => Promise<void>;
   checkStatus: () => Promise<void>;
   setupAdmin: (username: string, password: string) => Promise<void>;
-  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  changePassword: (currentPassword: string | null, newPassword: string) => Promise<void>;
   updateProfile: (payload: { username?: string; display_name?: string; avatar_emoji?: string | null; avatar_color?: string | null; ai_name?: string | null; ai_avatar_emoji?: string | null; ai_avatar_color?: string | null; ai_avatar_url?: string | null }) => Promise<void>;
   uploadAvatar: (file: File) => Promise<string>;
   fetchAppearance: () => Promise<void>;
   hasPermission: (permission: Permission) => boolean;
+  unbindFeishu: () => Promise<void>;
 }
 
 let checkAuthInFlight: Promise<void> | null = null;
@@ -147,11 +150,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     return checkAuthInFlight;
   },
 
-  changePassword: async (currentPassword: string, newPassword: string) => {
-    const data = await api.put<{ success: boolean; user: UserPublic }>('/api/auth/password', {
-      current_password: currentPassword,
-      new_password: newPassword,
-    });
+  changePassword: async (currentPassword: string | null, newPassword: string) => {
+    const body: Record<string, string> = { new_password: newPassword };
+    if (currentPassword) body.current_password = currentPassword;
+    const data = await api.put<{ success: boolean; user: UserPublic }>('/api/auth/password', body);
     set({ user: data.user });
   },
 
@@ -186,5 +188,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (!user) return false;
     if (user.role === 'admin') return true;
     return user.permissions.includes(permission);
+  },
+
+  unbindFeishu: async () => {
+    const data = await api.post<{ success: boolean; user: UserPublic }>('/api/auth/feishu/unbind', {});
+    set({ user: data.user });
   },
 }));

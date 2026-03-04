@@ -179,7 +179,7 @@ export const AppearanceConfigSchema = z.object({
 });
 
 export const ChangePasswordSchema = z.object({
-  current_password: z.string().min(1),
+  current_password: z.string().optional(),
   new_password: z.string().min(8).max(128),
 });
 

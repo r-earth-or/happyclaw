@@ -163,6 +163,8 @@ export interface UserPublic {
   id: string;
   username: string;
   display_name: string;
+  feishu_open_id: string | null;
+  has_password: boolean;
   role: UserRole;
   status: UserStatus;
   permissions: Permission[];

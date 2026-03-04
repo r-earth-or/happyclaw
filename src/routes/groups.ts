@@ -308,11 +308,13 @@ function resetWorkspaceForGroup(folder: string): void {
 function toPublicContainerEnvForUser(
   config: ReturnType<typeof getContainerEnvConfig>,
   user: AuthUser,
+  isOwnHomeGroup = false,
 ) {
   const base = toPublicContainerEnvConfig(config);
   if (
     user.role === 'admin' ||
-    (user.permissions && user.permissions.includes('manage_group_env'))
+    (user.permissions && user.permissions.includes('manage_group_env')) ||
+    isOwnHomeGroup
   ) {
     return base;
   }
@@ -1079,17 +1081,18 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
     );
   }
 
-  // Check permissions
+  // Check permissions: admin, manage_group_env, or own home group
+  const isOwnHomeGroup = !!group.is_home && group.created_by === user.id;
   if (
     user.role !== 'admin' &&
-    (!user.permissions ||
-      !user.permissions.includes('manage_group_env'))
+    (!user.permissions || !user.permissions.includes('manage_group_env')) &&
+    !isOwnHomeGroup
   ) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }
 
   const config = getContainerEnvConfig(group.folder);
-  return c.json(toPublicContainerEnvForUser(config, user));
+  return c.json(toPublicContainerEnvForUser(config, user, isOwnHomeGroup));
 });
 
 // PUT /api/groups/:jid/env - 更新容器环境变量配置
@@ -1109,11 +1112,12 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     );
   }
 
-  // Check permissions
+  // Check permissions: admin, manage_group_env, or own home group
+  const isOwnHomeGroupEnv = !!group.is_home && group.created_by === envUser.id;
   if (
     envUser.role !== 'admin' &&
-    (!envUser.permissions ||
-      !envUser.permissions.includes('manage_group_env'))
+    (!envUser.permissions || !envUser.permissions.includes('manage_group_env')) &&
+    !isOwnHomeGroupEnv
   ) {
     return c.json({ error: 'Insufficient permissions' }, 403);
   }

@@ -84,6 +84,8 @@ import {
   refreshOAuthCredentials,
   saveClaudeProviderConfig as saveClaudeProviderConfigForRefresh,
   updateAllSessionCredentials,
+  getContainerEnvConfig,
+  saveContainerEnvConfig,
 } from './runtime-config.js';
 import type { FeishuConnectConfig, TelegramConnectConfig } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
@@ -1324,7 +1326,7 @@ function startIpcWatcher(): void {
             if (
               entry.isFile() &&
               entry.name.endsWith('.json') &&
-              (entry.name.startsWith('install_skill_result_') || entry.name.startsWith('uninstall_skill_result_'))
+              (entry.name.startsWith('install_skill_result_') || entry.name.startsWith('uninstall_skill_result_') || entry.name.startsWith('set_env_var_result_'))
             ) {
               try {
                 const filePath = path.join(tasksDir, entry.name);
@@ -1342,7 +1344,8 @@ function startIpcWatcher(): void {
               entry.isFile() &&
               entry.name.endsWith('.json') &&
               !entry.name.startsWith('install_skill_result_') &&
-              !entry.name.startsWith('uninstall_skill_result_')
+              !entry.name.startsWith('uninstall_skill_result_') &&
+              !entry.name.startsWith('set_env_var_result_')
             )
             .map((entry) => entry.name);
           for (const file of taskFiles) {
@@ -1415,6 +1418,10 @@ async function processTaskIpc(
     package?: string;
     requestId?: string;
     skillId?: string;
+    // For set_env_var
+    key?: string;
+    value?: string;
+    targetFolder?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -1749,6 +1756,54 @@ async function processTaskIpc(
         );
       } else {
         logger.warn({ data }, 'Invalid uninstall_skill request - missing required fields');
+      }
+      break;
+
+    case 'set_env_var':
+      if (data.key && data.requestId && data.targetFolder !== undefined) {
+        const key = data.key;
+        const requestId = data.requestId;
+        const targetFolder = data.targetFolder;
+        if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+          logger.warn({ sourceGroup, requestId }, 'Rejected set_env_var request with invalid requestId');
+          break;
+        }
+        // Permission: non-admin can only set env for their own group
+        if (targetFolder !== sourceGroup && !isAdminHome) {
+          logger.warn({ sourceGroup, targetFolder }, 'Unauthorized set_env_var across groups');
+          break;
+        }
+        const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+        const tasksDirResolved = path.resolve(tasksDir);
+        const resultFileName = `set_env_var_result_${requestId}.json`;
+        const resultFilePath = path.resolve(tasksDir, resultFileName);
+        if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+          logger.warn({ sourceGroup, requestId, resultFilePath }, 'Rejected set_env_var request with unsafe result file path');
+          break;
+        }
+        const writeResult = (result: object) => {
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+          fs.writeFileSync(tmpPath, JSON.stringify(result));
+          fs.renameSync(tmpPath, resultFilePath);
+        };
+        try {
+          const config = getContainerEnvConfig(targetFolder);
+          if (!config.customEnv) config.customEnv = {};
+          if (data.value === '') {
+            delete config.customEnv[key];
+          } else {
+            config.customEnv[key] = data.value ?? '';
+          }
+          saveContainerEnvConfig(targetFolder, config);
+          writeResult({ success: true });
+          logger.info({ sourceGroup, targetFolder, key }, 'set_env_var via IPC completed');
+        } catch (err) {
+          writeResult({ success: false, error: err instanceof Error ? err.message : String(err) });
+          logger.error({ sourceGroup, targetFolder, key, err }, 'set_env_var via IPC failed');
+        }
+      } else {
+        logger.warn({ data }, 'Invalid set_env_var request - missing required fields');
       }
       break;
 

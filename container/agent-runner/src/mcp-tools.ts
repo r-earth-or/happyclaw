@@ -344,6 +344,76 @@ Use available_groups.json to find the JID for a group. The folder name should be
       },
     ),
 
+    // --- set_env_var ---
+    tool(
+      'set_env_var',
+      `Save an environment variable so it persists across container restarts.
+
+The value is stored in the same place as the Web UI env settings and will be visible there.
+Pass an empty string "" to remove a variable.
+
+WARNING: Do NOT write to ~/.zshrc or ~/.bashrc — those files are not persisted and will be lost when the container stops.
+
+Changes take effect on the next container start.`,
+      {
+        key: z.string().describe('Environment variable name'),
+        value: z.string().describe('Value to set. Pass an empty string "" to remove the variable.'),
+      },
+      async (args) => {
+        const key = args.key.trim();
+        if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid env var name: "${key}". Must be uppercase letters, digits, and underscores (e.g., MY_API_KEY).` }],
+            isError: true,
+          };
+        }
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const resultFileName = `set_env_var_result_${requestId}.json`;
+        const resultFilePath = path.join(TASKS_DIR, resultFileName);
+        const data = {
+          type: 'set_env_var',
+          key,
+          value: args.value,
+          targetFolder: ctx.groupFolder,
+          requestId,
+          groupFolder: ctx.groupFolder,
+          timestamp: new Date().toISOString(),
+        };
+        writeIpcFile(TASKS_DIR, data);
+        // Poll for result (timeout 10s)
+        const timeout = 10_000;
+        const pollInterval = 200;
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+          try {
+            if (fs.existsSync(resultFilePath)) {
+              const raw = fs.readFileSync(resultFilePath, 'utf-8');
+              fs.unlinkSync(resultFilePath);
+              const result = JSON.parse(raw);
+              if (result.success) {
+                const msg = args.value === ''
+                  ? `Environment variable "${key}" removed.`
+                  : `Environment variable "${key}" saved. It will take effect on the next container start.`;
+                return {
+                  content: [{ type: 'text' as const, text: msg }],
+                };
+              } else {
+                return {
+                  content: [{ type: 'text' as const, text: `Failed to save env var: ${result.error || 'Unknown error'}` }],
+                  isError: true,
+                };
+              }
+            }
+          } catch { /* retry */ }
+          await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        }
+        return {
+          content: [{ type: 'text' as const, text: `Timeout waiting for set_env_var result. The variable may or may not have been saved.` }],
+          isError: true,
+        };
+      },
+    ),
+
   ];
 
   // Skill 安装/卸载仅限主容器（与 memory_* 工具一致）

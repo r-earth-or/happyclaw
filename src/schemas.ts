@@ -142,6 +142,11 @@ export const LoginSchema = z.object({
   password: z.string().min(1),
 });
 
+export const FeishuOAuthCallbackSchema = z.object({
+  code: z.string().min(1),
+  state: z.string().min(1),
+});
+
 export const RegisterSchema = z.object({
   username: z.string().min(3).max(32),
   password: z.string().min(8).max(128),
@@ -283,14 +288,18 @@ export const FeishuConfigSchema = z
   .object({
     appId: z.string().max(2000).optional(),
     appSecret: z.string().max(2000).optional(),
+    baseUrl: z.string().max(2000).optional(),
     clearAppSecret: z.boolean().optional(),
+    disableGroupChat: z.boolean().optional(),
     enabled: z.boolean().optional(),
   })
   .refine(
     (data) =>
       typeof data.appId === 'string' ||
       typeof data.appSecret === 'string' ||
+      typeof data.baseUrl === 'string' ||
       data.clearAppSecret === true ||
+      typeof data.disableGroupChat === 'boolean' ||
       typeof data.enabled === 'boolean',
     { message: 'At least one config field must be provided' },
   );

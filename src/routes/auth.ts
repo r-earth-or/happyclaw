@@ -4,6 +4,7 @@ import fs from 'fs';
 import { readFile } from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import * as lark from '@larksuiteoapi/node-sdk';
 import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
@@ -11,6 +12,7 @@ import { getClientIp } from '../utils.js';
 import { DATA_DIR } from '../config.js';
 import {
   LoginSchema,
+  FeishuOAuthCallbackSchema,
   RegisterSchema,
   ProfileUpdateSchema,
   ChangePasswordSchema,
@@ -18,6 +20,7 @@ import {
 import {
   getUserByUsername,
   getUserById,
+  findOrCreateUserByFeishuOpenId,
   createInitialAdminUser,
   createUserSession,
   deleteUserSession,
@@ -33,6 +36,7 @@ import {
 import {
   getRegistrationConfig,
   getClaudeProviderConfig,
+  getFeishuProviderConfig,
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
 } from '../runtime-config.js';
@@ -115,6 +119,57 @@ function buildSetupStatus() {
     claudeConfigured,
     feishuConfigured,
   };
+}
+
+const FEISHU_OAUTH_FLOW_TTL_MS = 10 * 60 * 1000;
+const FEISHU_OAUTH_BASE_URL = 'https://open.feishu.cn';
+const FEISHU_AUTHORIZE_PATH = '/open-apis/authen/v1/index';
+const feishuOauthFlows = new Map<string, { expiresAt: number }>();
+
+const feishuOauthCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [state, flow] of feishuOauthFlows.entries()) {
+    if (flow.expiresAt <= now) {
+      feishuOauthFlows.delete(state);
+    }
+  }
+}, FEISHU_OAUTH_FLOW_TTL_MS);
+feishuOauthCleanupTimer.unref?.();
+
+function deriveRequestAppBaseUrl(requestUrl: string): string {
+  const url = new URL(requestUrl);
+  const apiIndex = url.pathname.indexOf('/api/');
+  const basePath = apiIndex >= 0 ? url.pathname.slice(0, apiIndex) : '';
+  return `${url.origin}${basePath}`;
+}
+
+function joinBaseUrl(baseUrl: string, appPath: string): string {
+  const normalizedBaseUrl = baseUrl.replace(/\/+$/, '');
+  const normalizedPath = appPath.startsWith('/') ? appPath : `/${appPath}`;
+  return `${normalizedBaseUrl}${normalizedPath}`;
+}
+
+function getPublicAppBaseUrl(requestUrl: string): string {
+  const config = getFeishuProviderConfig();
+  const value = config.baseUrl?.trim();
+  return value || deriveRequestAppBaseUrl(requestUrl);
+}
+
+function getAppUrl(requestUrl: string, appPath: string): string {
+  return joinBaseUrl(getPublicAppBaseUrl(requestUrl), appPath);
+}
+
+function redirectToLoginWithError(
+  c: { req: { url: string } },
+  message: string,
+): Response {
+  const target = `${getAppUrl(c.req.url, '/login')}?error=${encodeURIComponent(message)}`;
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: target,
+    },
+  });
 }
 
 // --- Routes ---
@@ -211,6 +266,167 @@ authRoutes.post('/setup', async (c) => {
   );
 });
 
+authRoutes.get('/feishu/authorize', (c) => {
+  const config = getFeishuProviderConfig();
+  if (!config.appId || !config.appSecret) {
+    return c.json({ error: 'Feishu OAuth is not configured' }, 400);
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  feishuOauthFlows.set(state, {
+    expiresAt: Date.now() + FEISHU_OAUTH_FLOW_TTL_MS,
+  });
+
+  const callbackUrl = getAppUrl(c.req.url, '/api/auth/feishu/callback');
+  const params = new URLSearchParams({
+    app_id: config.appId,
+    redirect_uri: callbackUrl,
+    state,
+  });
+
+  return c.json({
+    authorizeUrl: `${FEISHU_OAUTH_BASE_URL}${FEISHU_AUTHORIZE_PATH}?${params.toString()}`,
+  });
+});
+
+authRoutes.get('/feishu/callback', async (c) => {
+  const validation = FeishuOAuthCallbackSchema.safeParse({
+    code: c.req.query('code'),
+    state: c.req.query('state'),
+  });
+  if (!validation.success) {
+    return redirectToLoginWithError(c, '飞书授权参数无效');
+  }
+
+  const { code, state } = validation.data;
+  const flow = feishuOauthFlows.get(state);
+  if (!flow) {
+    return redirectToLoginWithError(c, '飞书授权状态已失效，请重试');
+  }
+  if (flow.expiresAt <= Date.now()) {
+    feishuOauthFlows.delete(state);
+    return redirectToLoginWithError(c, '飞书授权已过期，请重试');
+  }
+  feishuOauthFlows.delete(state);
+
+    const config = getFeishuProviderConfig();
+    if (!config.appId || !config.appSecret) {
+      return redirectToLoginWithError(c, '飞书登录未配置');
+  }
+
+  try {
+    const client = new lark.Client({
+      appId: config.appId,
+      appSecret: config.appSecret,
+      appType: lark.AppType.SelfBuild,
+    });
+
+    const tokenResp = await client.authen.v1.accessToken.create({
+      data: {
+        grant_type: 'authorization_code',
+        code,
+      },
+    });
+    if ((tokenResp.code ?? 0) !== 0 || !tokenResp.data?.access_token) {
+      logger.warn({ tokenResp }, 'Feishu OAuth token exchange failed');
+      return redirectToLoginWithError(c, '飞书登录失败，请重试');
+    }
+
+    const userInfoResp = await client.authen.userInfo.get(
+      {},
+      lark.withUserAccessToken(tokenResp.data.access_token),
+    );
+    if ((userInfoResp.code ?? 0) !== 0) {
+      logger.warn({ userInfoResp }, 'Feishu OAuth user info lookup failed');
+      return redirectToLoginWithError(c, '获取飞书用户信息失败');
+    }
+
+    const openId = userInfoResp.data?.open_id || tokenResp.data.open_id || '';
+    const displayName =
+      userInfoResp.data?.name || tokenResp.data.name || tokenResp.data.en_name || '';
+    if (!openId) {
+      logger.warn({ tokenResp, userInfoResp }, 'Feishu OAuth missing open_id');
+      return redirectToLoginWithError(c, '飞书账号信息不完整');
+    }
+
+    const ip = getClientIp(c);
+    const ua = c.req.header('user-agent') || null;
+    const { user, created } = findOrCreateUserByFeishuOpenId({
+      openId,
+      displayName,
+    });
+
+    if (user.status !== 'active') {
+      logAuthEvent({
+        event_type: 'login_failed',
+        username: user.username,
+        ip_address: ip,
+        user_agent: ua,
+        details: { reason: 'account_inactive', source: 'feishu_oauth' },
+      });
+      return redirectToLoginWithError(c, '账号已被禁用');
+    }
+
+    const now = new Date().toISOString();
+    try {
+      ensureUserHomeGroup(user.id, user.role, user.username);
+    } catch (err) {
+      logger.warn({ err, userId: user.id }, 'Failed to ensure home group during Feishu OAuth login');
+    }
+
+    const token = generateSessionToken();
+    createUserSession({
+      id: token,
+      user_id: user.id,
+      ip_address: ip,
+      user_agent: ua,
+      created_at: now,
+      expires_at: sessionExpiresAt(),
+      last_active_at: now,
+    });
+    updateUserFields(user.id, { last_login_at: now });
+
+    if (created) {
+      logAuthEvent({
+        event_type: 'user_created',
+        username: user.username,
+        actor_username: 'feishu_oauth',
+        ip_address: ip,
+        user_agent: ua,
+        details: { source: 'feishu_oauth', role: user.role, feishu_open_id: openId },
+      });
+    }
+    logAuthEvent({
+      event_type: 'login_success',
+      username: user.username,
+      ip_address: ip,
+      user_agent: ua,
+      details: { source: 'feishu_oauth' },
+    });
+
+    const updatedUser = getUserById(user.id) ?? user;
+    const setupStatus =
+      updatedUser.role === 'admin' ? buildSetupStatus() : undefined;
+    const nextPath =
+      updatedUser.role === 'admin' && setupStatus?.needsSetup
+        ? '/setup/providers'
+        : updatedUser.must_change_password
+          ? '/settings'
+          : '/chat';
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: getAppUrl(c.req.url, nextPath),
+        'Set-Cookie': setSessionCookie(token),
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, 'Feishu OAuth callback failed');
+    return redirectToLoginWithError(c, '飞书登录失败，请稍后重试');
+  }
+});
+
 authRoutes.post('/login', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = LoginSchema.safeParse(body);
@@ -247,6 +463,8 @@ authRoutes.post('/login', async (c) => {
   }
 
   const user = getUserByUsername(username);
+  const passwordLoginAllowed =
+    !!user && typeof user.password_hash === 'string' && user.password_hash.length > 0;
 
   // Constant-time: always run bcrypt compare even if user doesn't exist (prevents timing attacks)
   // 使用运行时生成的合法 bcrypt hash，确保 bcrypt.compare 不会抛异常
@@ -255,14 +473,14 @@ authRoutes.post('/login', async (c) => {
   try {
     passwordMatch = await verifyPassword(
       password,
-      user ? user.password_hash : DUMMY_HASH,
+      passwordLoginAllowed ? user.password_hash : DUMMY_HASH,
     );
   } catch {
     // 如果 hash 格式异常，视为不匹配，不泄漏内部错误
     passwordMatch = false;
   }
 
-  if (!user || user.status !== 'active' || !passwordMatch) {
+  if (!user || user.status !== 'active' || !passwordLoginAllowed || !passwordMatch) {
     recordLoginAttempt(username, ip);
     logAuthEvent({
       event_type: 'login_failed',
@@ -274,6 +492,8 @@ authRoutes.post('/login', async (c) => {
           ? 'user_not_found'
           : user.status !== 'active'
             ? 'account_inactive'
+            : !passwordLoginAllowed
+              ? 'password_login_disabled'
             : 'wrong_password',
       },
     });

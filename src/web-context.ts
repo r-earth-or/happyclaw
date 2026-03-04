@@ -22,7 +22,13 @@ export interface WebDeps {
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
-  reloadFeishuConnection?: (config: { appId: string; appSecret: string; enabled?: boolean }) => Promise<boolean>;
+  reloadFeishuConnection?: (config: {
+    appId: string;
+    appSecret: string;
+    baseUrl?: string;
+    disableGroupChat?: boolean;
+    enabled?: boolean;
+  }) => Promise<boolean>;
   reloadTelegramConnection?: (config: { botToken: string; enabled?: boolean }) => Promise<boolean>;
   reloadUserIMConfig?: (userId: string, channel: 'feishu' | 'telegram') => Promise<boolean>;
   isFeishuConnected?: () => boolean;

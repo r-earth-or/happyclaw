@@ -13,7 +13,9 @@ export function FeishuConfigForm({ setNotice, setError }: FeishuConfigFormProps)
   const [config, setConfig] = useState<FeishuConfigPublic | null>(null);
   const [appId, setAppId] = useState('');
   const [appSecret, setAppSecret] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
   const [clearSecret, setClearSecret] = useState(false);
+  const [disableGroupChat, setDisableGroupChat] = useState(true);
   const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -27,7 +29,9 @@ export function FeishuConfigForm({ setNotice, setError }: FeishuConfigFormProps)
       setConfig(data);
       setAppId(data.appId || '');
       setAppSecret('');
+      setBaseUrl(data.baseUrl || '');
       setClearSecret(false);
+      setDisableGroupChat(data.disableGroupChat ?? true);
       setEnabled(data.enabled);
     } catch (err) {
       setError(getErrorMessage(err, '加载飞书配置失败'));
@@ -45,6 +49,8 @@ export function FeishuConfigForm({ setNotice, setError }: FeishuConfigFormProps)
     try {
       const saved = await api.put<FeishuConfigPublic>('/api/config/feishu', { enabled: newEnabled });
       setConfig(saved);
+      setBaseUrl(saved.baseUrl || '');
+      setDisableGroupChat(saved.disableGroupChat ?? true);
       setEnabled(saved.enabled);
       setNotice(`飞书渠道已${newEnabled ? '启用' : '停用'}${saved.connected ? '，已连接' : ''}`);
 
@@ -60,14 +66,21 @@ export function FeishuConfigForm({ setNotice, setError }: FeishuConfigFormProps)
     setNotice(null);
     setError(null);
     try {
-      const payload: Record<string, unknown> = { appId, enabled };
+      const payload: Record<string, unknown> = {
+        appId,
+        baseUrl,
+        disableGroupChat,
+        enabled,
+      };
       if (appSecret.trim()) payload.appSecret = appSecret;
       if (!appSecret.trim() && clearSecret) payload.clearAppSecret = true;
 
       const saved = await api.put<FeishuConfigPublic>('/api/config/feishu', payload);
       setConfig(saved);
       setAppSecret('');
+      setBaseUrl(saved.baseUrl || '');
       setClearSecret(false);
+      setDisableGroupChat(saved.disableGroupChat ?? true);
       setNotice(`飞书配置已保存并生效${saved.connected ? '，已连接' : ''}`);
 
     } catch (err) {
@@ -140,6 +153,39 @@ export function FeishuConfigForm({ setNotice, setError }: FeishuConfigFormProps)
                 disabled={saving}
               />
               清空现有 Secret
+            </label>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs text-slate-600 mb-1">系统 Base URL</label>
+            <Input
+              type="url"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              disabled={loading || saving}
+              placeholder="https://your-domain.com"
+            />
+            <p className="mt-1 text-xs text-slate-400">用于生成飞书 OAuth 回调地址。部署在反向代理、域名或子路径下时建议显式填写</p>
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-600 mb-2">群聊控制</label>
+            <label className="flex items-start gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={disableGroupChat}
+                onChange={(e) => setDisableGroupChat(e.target.checked)}
+                disabled={loading || saving}
+                className="mt-0.5"
+              />
+              <span>
+                禁用群聊消息
+                <span className="block text-xs text-slate-400 mt-1">
+                  开启后，系统级飞书机器人将忽略群聊消息，只处理私聊消息
+                </span>
+              </span>
             </label>
           </div>
         </div>

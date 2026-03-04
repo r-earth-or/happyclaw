@@ -26,6 +26,7 @@ export interface UserIMConnection {
 export interface FeishuConnectConfig {
   appId: string;
   appSecret: string;
+  disableGroupChat?: boolean;
   enabled?: boolean;
 }
 
@@ -41,12 +42,21 @@ export interface ConnectFeishuOptions {
   resolveGroupFolder?: (chatJid: string) => string | undefined;
   resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  resolveRouteHint?: (context: {
+    chatJid: string;
+    chatType?: string;
+    senderOpenId?: string;
+    senderName?: string;
+  }) =>
+    | { userId?: string; homeFolder?: string; suppress?: boolean }
+    | null;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
 }
 
 class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
+  private sharedChannels = new Map<string, IMChannel>();
   private adminUserIds = new Set<string>();
 
   /** Register a user ID as admin (for fallback routing) */
@@ -86,6 +96,21 @@ class IMConnectionManager {
     return connected;
   }
 
+  async connectSharedChannel(
+    channelType: string,
+    channel: IMChannel,
+    opts: IMChannelConnectOpts,
+  ): Promise<boolean> {
+    await this.disconnectSharedChannel(channelType);
+
+    const connected = await channel.connect(opts);
+    if (connected) {
+      this.sharedChannels.set(channelType, channel);
+      logger.info({ channelType }, 'Shared IM channel connected');
+    }
+    return connected;
+  }
+
   /**
    * Disconnect a specific channel type for a user.
    */
@@ -96,6 +121,15 @@ class IMConnectionManager {
       await channel.disconnect();
       conn!.channels.delete(channelType);
       logger.info({ userId, channelType }, 'IM channel disconnected');
+    }
+  }
+
+  async disconnectSharedChannel(channelType: string): Promise<void> {
+    const channel = this.sharedChannels.get(channelType);
+    if (channel) {
+      await channel.disconnect();
+      this.sharedChannels.delete(channelType);
+      logger.info({ channelType }, 'Shared IM channel disconnected');
     }
   }
 
@@ -169,6 +203,11 @@ class IMConnectionManager {
       }
     }
 
+    const shared = this.sharedChannels.get(channelType);
+    if (shared?.isConnected()) {
+      return shared;
+    }
+
     return undefined;
   }
 
@@ -191,6 +230,7 @@ class IMConnectionManager {
     const channel = createFeishuChannel({
       appId: config.appId,
       appSecret: config.appSecret,
+      disableGroupChat: config.disableGroupChat,
     });
 
     return this.connectChannel(userId, 'feishu', channel, {
@@ -203,6 +243,39 @@ class IMConnectionManager {
       resolveGroupFolder: options?.resolveGroupFolder,
       resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
       onAgentMessage: options?.onAgentMessage,
+      resolveRouteHint: options?.resolveRouteHint,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
+    });
+  }
+
+  async connectSharedFeishu(
+    config: FeishuConnectConfig,
+    onNewChat: (chatJid: string, chatName: string) => void,
+    options?: ConnectFeishuOptions,
+  ): Promise<boolean> {
+    if (!config.appId || !config.appSecret) {
+      logger.info('Shared Feishu config empty, skipping connection');
+      return false;
+    }
+
+    const channel = createFeishuChannel({
+      appId: config.appId,
+      appSecret: config.appSecret,
+      disableGroupChat: config.disableGroupChat,
+    });
+
+    return this.connectSharedChannel('feishu', channel, {
+      onReady: () => {
+        logger.info('Shared Feishu WebSocket connected');
+      },
+      onNewChat,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      resolveRouteHint: options?.resolveRouteHint,
       onBotAddedToGroup: options?.onBotAddedToGroup,
       onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
     });
@@ -244,6 +317,10 @@ class IMConnectionManager {
 
   async disconnectUserFeishu(userId: string): Promise<void> {
     await this.disconnectChannel(userId, 'feishu');
+  }
+
+  async disconnectSharedFeishu(): Promise<void> {
+    await this.disconnectSharedChannel('feishu');
   }
 
   async disconnectUserTelegram(userId: string): Promise<void> {
@@ -313,9 +390,20 @@ class IMConnectionManager {
     }
   }
 
+  async syncSharedFeishu(): Promise<void> {
+    const channel = this.sharedChannels.get('feishu');
+    if (channel?.isConnected() && channel.syncGroups) {
+      await channel.syncGroups();
+    }
+  }
+
   isFeishuConnected(userId: string): boolean {
     const conn = this.connections.get(userId);
     return conn?.channels.get('feishu')?.isConnected() ?? false;
+  }
+
+  isSharedFeishuConnected(): boolean {
+    return this.sharedChannels.get('feishu')?.isConnected() ?? false;
   }
 
   isTelegramConnected(userId: string): boolean {
@@ -325,6 +413,7 @@ class IMConnectionManager {
 
   /** Check if any user has an active Feishu connection */
   isAnyFeishuConnected(): boolean {
+    if (this.isSharedFeishuConnected()) return true;
     for (const conn of this.connections.values()) {
       if (conn.channels.get('feishu')?.isConnected()) return true;
     }
@@ -403,8 +492,17 @@ class IMConnectionManager {
       }
     }
 
+    for (const [channelType, channel] of this.sharedChannels.entries()) {
+      promises.push(
+        channel.disconnect().catch((err) => {
+          logger.warn({ channelType, err }, 'Error stopping shared IM channel');
+        }),
+      );
+    }
+
     await Promise.allSettled(promises);
     this.connections.clear();
+    this.sharedChannels.clear();
     logger.info('All IM connections disconnected');
   }
 }

@@ -14,6 +14,8 @@ export interface ClaudeConfigPublic {
 
 export interface FeishuConfigPublic {
   appId: string;
+  baseUrl: string;
+  disableGroupChat: boolean;
   hasAppSecret: boolean;
   appSecretMasked: string | null;
   enabled: boolean;

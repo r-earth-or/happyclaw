@@ -19,6 +19,7 @@ import { detectImageMimeType } from './image-detector.js';
 export interface FeishuConnectionConfig {
   appId: string;
   appSecret: string;
+  disableGroupChat?: boolean;
 }
 
 /** 飞书文件信息（用于下载到工作区） */
@@ -30,7 +31,11 @@ interface FeishuFileInfo {
 export interface ConnectOptions {
   onReady: () => void;
   /** 收到消息后调用，让调用方自动注册未知的飞书聊天 */
-  onNewChat?: (chatJid: string, chatName: string) => void;
+  onNewChat?: (
+    chatJid: string,
+    chatName: string,
+    routeHint?: { userId: string; homeFolder: string },
+  ) => void;
   /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
   /** 斜杠指令回调（如 /clear），返回回复文本或 null */
@@ -41,6 +46,15 @@ export interface ConnectOptions {
   resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** 共享机器人模式下，根据消息发送者决定归属用户 */
+  resolveRouteHint?: (context: {
+    chatJid: string;
+    chatType?: string;
+    senderOpenId?: string;
+    senderName?: string;
+  }) =>
+    | { userId?: string; homeFolder?: string; suppress?: boolean }
+    | null;
   /** Bot 被添加到群聊时调用（自动注册群组） */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用（自动解绑 IM 绑定） */
@@ -521,7 +535,15 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     payload: IncomingMessagePayload,
     source: 'ws' | 'backfill',
   ): Promise<void> {
-    const { onNewChat, ignoreMessagesBefore, onCommand, resolveGroupFolder, resolveEffectiveChatJid, onAgentMessage } = connectOptions || {};
+    const {
+      onNewChat,
+      ignoreMessagesBefore,
+      onCommand,
+      resolveGroupFolder,
+      resolveEffectiveChatJid,
+      onAgentMessage,
+      resolveRouteHint,
+    } = connectOptions || {};
     const {
       chatId,
       messageId,
@@ -550,6 +572,12 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       return;
     }
 
+    const chatJid = `feishu:${chatId}`;
+    if (chatType && chatType !== 'p2p' && config.disableGroupChat === true) {
+      logger.info({ chatJid, messageId, source }, 'Feishu group chat disabled, skipping message');
+      return;
+    }
+
     const extracted = extractMessageContent(messageType, rawContent);
     let text = extracted.text;
     if (!text && !extracted.imageKeys && !extracted.fileInfos?.length) {
@@ -568,12 +596,38 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       }
     }
 
-    const chatJid = `feishu:${chatId}`;
+    if (senderOpenId && senderName?.trim()) {
+      senderNameCache.set(senderOpenId, senderName.trim());
+    }
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
+    const routeHint =
+      resolveRouteHint?.({
+        chatJid,
+        chatType,
+        senderOpenId,
+        senderName: resolvedSenderName,
+      }) || undefined;
+
+    if (routeHint?.suppress) {
+      logger.info(
+        { chatJid, messageId, senderOpenId, source },
+        'Feishu message suppressed by route resolver',
+      );
+      return;
+    }
 
     // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
-    onNewChat?.(chatJid, resolvedChatName);
+    onNewChat?.(
+      chatJid,
+      resolvedChatName,
+      routeHint?.userId && routeHint?.homeFolder
+        ? {
+            userId: routeHint.userId,
+            homeFolder: routeHint.homeFolder,
+          }
+        : undefined,
+    );
 
     let attachmentsJson: string | undefined;
 
@@ -718,6 +772,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
             deleted?: boolean;
             sender?: {
               id?: string;
+              name?: string;
+              sender_name?: string;
               sender_id?: {
                 open_id?: string;
               };
@@ -748,6 +804,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
             chatType: item.chat_type,
             mentions: item.mentions,
             senderOpenId,
+            senderName: item.sender?.sender_name || item.sender?.name || '',
           };
         })
         .sort((a, b) => a.createTimeMs - b.createTimeMs);
@@ -892,6 +949,11 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         'im.message.receive_v1': async (data) => {
           try {
             const message = data.message;
+            const sender = data.sender as {
+              sender_id?: { open_id?: string };
+              sender_name?: string;
+              name?: string;
+            };
             await handleIncomingMessage(
               {
                 chatId: message.chat_id,
@@ -901,7 +963,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
                 content: message.content,
                 chatType: message.chat_type,
                 mentions: message.mentions as FeishuMentionLike[] | undefined,
-                senderOpenId: data.sender.sender_id?.open_id || '',
+                senderOpenId: sender.sender_id?.open_id || '',
+                senderName: sender.sender_name || sender.name || '',
               },
               'ws',
             );

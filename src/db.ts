@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -174,6 +175,7 @@ export function initDatabase(): void {
       id TEXT PRIMARY KEY,
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
+      feishu_open_id TEXT UNIQUE,
       display_name TEXT NOT NULL DEFAULT '',
       role TEXT NOT NULL DEFAULT 'member',
       status TEXT NOT NULL DEFAULT 'active',
@@ -273,6 +275,7 @@ export function initDatabase(): void {
   ensureColumn('users', 'disable_reason', 'TEXT');
   ensureColumn('users', 'notes', 'TEXT');
   ensureColumn('users', 'deleted_at', 'TEXT');
+  ensureColumn('users', 'feishu_open_id', 'TEXT');
   ensureColumn('invite_codes', 'permission_template', 'TEXT');
   ensureColumn('invite_codes', 'permissions', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('users', 'avatar_emoji', 'TEXT');
@@ -298,6 +301,9 @@ export function initDatabase(): void {
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec('CREATE INDEX IF NOT EXISTS idx_rg_target_agent ON registered_groups(target_agent_id)');
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_open_id ON users(feishu_open_id) WHERE feishu_open_id IS NOT NULL AND feishu_open_id != ''",
+  );
 
   // Migration: remove UNIQUE constraint from registered_groups.folder
   // Multiple groups (web:main + feishu chats) share folder='main' by design.
@@ -384,6 +390,7 @@ export function initDatabase(): void {
     'id',
     'username',
     'password_hash',
+    'feishu_open_id',
     'display_name',
     'role',
     'status',
@@ -521,7 +528,7 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '19';
+  const SCHEMA_VERSION = '20';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1449,6 +1456,8 @@ function mapUserRow(row: Record<string, unknown>): User {
     id: String(row.id),
     username: String(row.username),
     password_hash: String(row.password_hash),
+    feishu_open_id:
+      typeof row.feishu_open_id === 'string' ? row.feishu_open_id : null,
     display_name: String(row.display_name ?? ''),
     role,
     status,
@@ -1507,6 +1516,7 @@ export interface CreateUserInput {
   id: string;
   username: string;
   password_hash: string;
+  feishu_open_id?: string | null;
   display_name: string;
   role: UserRole;
   status: UserStatus;
@@ -1526,13 +1536,14 @@ export function createUser(user: CreateUserInput): void {
   );
   db.prepare(
     `INSERT INTO users (
-      id, username, password_hash, display_name, role, status, permissions, must_change_password,
+      id, username, password_hash, feishu_open_id, display_name, role, status, permissions, must_change_password,
       disable_reason, notes, created_at, updated_at, last_login_at, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     user.id,
     user.username,
     user.password_hash,
+    user.feishu_open_id ?? null,
     user.display_name,
     user.role,
     user.status,
@@ -1588,6 +1599,103 @@ export function getUserByUsername(username: string): User | undefined {
     .prepare('SELECT * FROM users WHERE username = ?')
     .get(username) as Record<string, unknown> | undefined;
   return row ? mapUserRow(row) : undefined;
+}
+
+export function getUserByFeishuOpenId(openId: string): User | undefined {
+  const normalized = openId.trim();
+  if (!normalized) return undefined;
+  const row = db
+    .prepare('SELECT * FROM users WHERE feishu_open_id = ?')
+    .get(normalized) as Record<string, unknown> | undefined;
+  return row ? mapUserRow(row) : undefined;
+}
+
+function buildFeishuUsernameBase(displayName: string, openId: string): string {
+  const normalizedDisplayName = displayName
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/[\u0000-\u001F\u007F]/g, '');
+  const fallbackSuffix =
+    openId.replace(/[^a-zA-Z0-9]/g, '').slice(-8) || 'user';
+  const base = normalizedDisplayName || `feishu_${fallbackSuffix}`;
+  return base.slice(0, 32) || `feishu_${fallbackSuffix}`;
+}
+
+function nextAvailableUsername(base: string): string {
+  const normalizedBase = base.slice(0, 32) || 'feishu_user';
+  let candidate = normalizedBase;
+  let suffix = 1;
+
+  while (
+    db.prepare('SELECT 1 FROM users WHERE username = ?').get(candidate)
+  ) {
+    const suffixText = `_${suffix}`;
+    const availableLength = Math.max(1, 32 - suffixText.length);
+    candidate = `${normalizedBase.slice(0, availableLength)}${suffixText}`;
+    suffix++;
+  }
+
+  return candidate;
+}
+
+export function findOrCreateUserByFeishuOpenId(input: {
+  openId: string;
+  displayName?: string;
+}): { user: User; created: boolean } {
+  const openId = input.openId.trim();
+  if (!openId) {
+    throw new Error('Feishu openId is required');
+  }
+  const displayName = input.displayName?.trim() || '';
+
+  const tx = db.transaction(
+    (params: { openId: string; displayName: string }): { user: User; created: boolean } => {
+      const existing = db
+        .prepare('SELECT * FROM users WHERE feishu_open_id = ?')
+        .get(params.openId) as Record<string, unknown> | undefined;
+      if (existing) {
+        const current = mapUserRow(existing);
+        if (params.displayName && params.displayName !== current.display_name) {
+          updateUserFields(current.id, { display_name: params.displayName });
+          return {
+            user: getUserById(current.id) ?? { ...current, display_name: params.displayName },
+            created: false,
+          };
+        }
+        return { user: current, created: false };
+      }
+
+      const now = new Date().toISOString();
+      const countRow = db.prepare('SELECT COUNT(*) as count FROM users').get() as {
+        count: number;
+      };
+      const role: UserRole = countRow.count === 0 ? 'admin' : 'member';
+      const username = nextAvailableUsername(
+        buildFeishuUsernameBase(params.displayName, params.openId),
+      );
+      const id = crypto.randomUUID();
+
+      createUser({
+        id,
+        username,
+        password_hash: '',
+        feishu_open_id: params.openId,
+        display_name: params.displayName || username,
+        role,
+        status: 'active',
+        notes: 'Auto-created from Feishu',
+        created_at: now,
+        updated_at: now,
+      });
+
+      return {
+        user: getUserById(id)!,
+        created: true,
+      };
+    },
+  );
+
+  return tx({ openId, displayName });
 }
 
 export interface ListUsersOptions {
@@ -2016,13 +2124,14 @@ export function registerUserWithInvite(input: {
       const permissions = normalizePermissions(invitePermissions);
       db.prepare(
         `INSERT INTO users (
-        id, username, password_hash, display_name, role, status, permissions, must_change_password,
+        id, username, password_hash, feishu_open_id, display_name, role, status, permissions, must_change_password,
         disable_reason, notes, created_at, updated_at, last_login_at, deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         params.id,
         params.username,
         params.password_hash,
+        null,
         params.display_name,
         inviteRole,
         'active',
@@ -2071,13 +2180,14 @@ export function registerUserWithoutInvite(input: {
   try {
     db.prepare(
       `INSERT INTO users (
-        id, username, password_hash, display_name, role, status, permissions, must_change_password,
+        id, username, password_hash, feishu_open_id, display_name, role, status, permissions, must_change_password,
         disable_reason, notes, created_at, updated_at, last_login_at, deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.id,
       input.username,
       input.password_hash,
+      null,
       input.display_name,
       role,
       'active',

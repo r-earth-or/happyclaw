@@ -519,6 +519,12 @@ configRoutes.put(
     } else if (validation.data.clearAppSecret === true) {
       next.appSecret = '';
     }
+    if (typeof validation.data.baseUrl === 'string') {
+      next.baseUrl = validation.data.baseUrl;
+    }
+    if (typeof validation.data.disableGroupChat === 'boolean') {
+      next.disableGroupChat = validation.data.disableGroupChat;
+    }
     if (typeof validation.data.enabled === 'boolean') {
       next.enabled = validation.data.enabled;
     }
@@ -527,6 +533,8 @@ configRoutes.put(
       const saved = saveFeishuProviderConfig({
         appId: next.appId,
         appSecret: next.appSecret,
+        baseUrl: next.baseUrl,
+        disableGroupChat: next.disableGroupChat,
         enabled: next.enabled,
       });
 

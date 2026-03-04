@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth';
 import { api } from '../api/client';
+import { getFeishuAuthUrl } from '../api/auth';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 
@@ -16,6 +17,7 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [feishuLoading, setFeishuLoading] = useState(false);
   const navigate = useNavigate();
   const login = useAuthStore((state) => state.login);
   const initialized = useAuthStore((state) => state.initialized);
@@ -46,6 +48,14 @@ export function LoginPage() {
       });
   }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauthError = params.get('error');
+    if (oauthError) {
+      setError(oauthError);
+    }
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -64,6 +74,18 @@ export function LoginPage() {
       setError(err instanceof Error ? err.message : typeof err === 'object' && err !== null && 'message' in err ? String((err as { message: unknown }).message) : '登录失败');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleFeishuLogin = async () => {
+    setError('');
+    setFeishuLoading(true);
+    try {
+      const authorizeUrl = await getFeishuAuthUrl();
+      window.location.assign(authorizeUrl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : typeof err === 'object' && err !== null && 'message' in err ? String((err as { message: unknown }).message) : '飞书登录失败');
+      setFeishuLoading(false);
     }
   };
 
@@ -135,6 +157,23 @@ export function LoginPage() {
               {loading ? '登录中...' : '登录'}
             </Button>
           </form>
+
+          <div className="my-4 flex items-center gap-3 text-xs text-slate-400">
+            <div className="h-px flex-1 bg-slate-200" />
+            <span>或</span>
+            <div className="h-px flex-1 bg-slate-200" />
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            disabled={loading || feishuLoading}
+            className="w-full"
+            onClick={handleFeishuLogin}
+          >
+            {feishuLoading && <Loader2 className="size-4 animate-spin" />}
+            {feishuLoading ? '跳转飞书中...' : '使用飞书登录'}
+          </Button>
 
           {/* Register Link — hidden when registration is disabled */}
           {regStatus.allowRegistration && (

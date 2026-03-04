@@ -109,6 +109,8 @@ export interface ClaudeProviderPublicConfig {
 export interface FeishuProviderConfig {
   appId: string;
   appSecret: string;
+  baseUrl?: string;
+  disableGroupChat?: boolean;
   enabled?: boolean;
   updatedAt: string | null;
 }
@@ -117,6 +119,8 @@ export type FeishuConfigSource = 'runtime' | 'env' | 'none';
 
 export interface FeishuProviderPublicConfig {
   appId: string;
+  baseUrl: string;
+  disableGroupChat: boolean;
   hasAppSecret: boolean;
   appSecretMasked: string | null;
   enabled: boolean;
@@ -166,6 +170,8 @@ interface TelegramSecretPayload {
 interface StoredFeishuProviderConfigV1 {
   version: 1;
   appId: string;
+  baseUrl?: string;
+  disableGroupChat?: boolean;
   enabled?: boolean;
   updatedAt: string;
   secret: EncryptedSecrets;
@@ -248,6 +254,16 @@ function normalizeFeishuAppId(input: unknown): string {
     throw new Error('Field too long: appId');
   }
   return value;
+}
+
+function normalizeFeishuDisableGroupChat(input: unknown): boolean {
+  if (typeof input === 'boolean') return input;
+  if (typeof input === 'string') {
+    const value = input.trim().toLowerCase();
+    if (!value) return true;
+    return !['0', 'false', 'no', 'off'].includes(value);
+  }
+  return true;
 }
 
 function normalizeTelegramProxyUrl(input: unknown): string {
@@ -513,6 +529,8 @@ function readStoredFeishuConfig(): FeishuProviderConfig | null {
   return {
     appId: normalizeFeishuAppId(stored.appId ?? ''),
     appSecret: secret.appSecret,
+    baseUrl: normalizeBaseUrl(stored.baseUrl ?? ''),
+    disableGroupChat: normalizeFeishuDisableGroupChat(stored.disableGroupChat),
     enabled: stored.enabled,
     updatedAt: stored.updatedAt || null,
   };
@@ -522,10 +540,14 @@ function defaultsFeishuFromEnv(): FeishuProviderConfig {
   const raw = {
     appId: process.env.FEISHU_APP_ID || '',
     appSecret: process.env.FEISHU_APP_SECRET || '',
+    baseUrl: process.env.FEISHU_BASE_URL || '',
+    disableGroupChat: process.env.FEISHU_DISABLE_GROUP_CHAT,
   };
   return {
     appId: raw.appId.trim(),
     appSecret: raw.appSecret.trim(),
+    baseUrl: normalizeBaseUrl(raw.baseUrl),
+    disableGroupChat: normalizeFeishuDisableGroupChat(raw.disableGroupChat),
     updatedAt: null,
   };
 }
@@ -562,6 +584,8 @@ export function saveFeishuProviderConfig(
   const normalized: FeishuProviderConfig = {
     appId: normalizeFeishuAppId(next.appId),
     appSecret: normalizeSecret(next.appSecret, 'appSecret'),
+    baseUrl: normalizeBaseUrl(next.baseUrl ?? ''),
+    disableGroupChat: normalizeFeishuDisableGroupChat(next.disableGroupChat),
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
   };
@@ -569,6 +593,8 @@ export function saveFeishuProviderConfig(
   const payload: StoredFeishuProviderConfigV1 = {
     version: 1,
     appId: normalized.appId,
+    baseUrl: normalized.baseUrl,
+    disableGroupChat: normalized.disableGroupChat,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
     secret: encryptFeishuSecret({ appSecret: normalized.appSecret }),
@@ -587,6 +613,8 @@ export function toPublicFeishuProviderConfig(
 ): FeishuProviderPublicConfig {
   return {
     appId: config.appId,
+    baseUrl: config.baseUrl?.trim() || '',
+    disableGroupChat: config.disableGroupChat === true,
     hasAppSecret: !!config.appSecret,
     appSecretMasked: maskSecret(config.appSecret),
     enabled: config.enabled !== false,

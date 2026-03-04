@@ -139,6 +139,7 @@ export interface User {
   id: string;
   username: string;
   password_hash: string;
+  feishu_open_id: string | null;
   display_name: string;
   role: UserRole;
   status: UserStatus;

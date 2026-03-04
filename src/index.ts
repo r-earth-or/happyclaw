@@ -40,6 +40,7 @@ import {
   getJidsByFolder,
   getLastGroupSync,
   getRegisteredGroup,
+  findOrCreateUserByFeishuOpenId,
   getUserById,
   getMessagesSince,
   getNewMessages,
@@ -54,6 +55,7 @@ import {
   setRouterState,
   setSession,
   deleteSession,
+  logAuthEvent,
   storeMessageDirect,
   updateChatName,
   updateTask,
@@ -450,6 +452,11 @@ async function syncGroupMetadata(force = false): Promise<void> {
         return;
       }
     }
+  }
+
+  if (imManager.isSharedFeishuConnected()) {
+    await imManager.syncSharedFeishu();
+    return;
   }
 
   // Sync groups via any connected user's Feishu instance
@@ -2227,16 +2234,149 @@ async function ensureDockerRunning(): Promise<void> {
  * their channel and a member enables the same credentials), existing chats
  * are re-routed to the new user's home folder on first message receipt.
  */
-function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, chatName: string) => void {
-  return (chatJid, chatName) => {
-    const existing = registeredGroups[chatJid];
+function resolveGroupFolderForIm(chatJid: string): string | undefined {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (group && !registeredGroups[chatJid]) {
+    registeredGroups[chatJid] = group;
+  }
+  return group?.folder;
+}
+
+function ensureUserHomeGroupCached(
+  userId: string,
+  role: 'admin' | 'member',
+  username: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  const homeJid = ensureUserHomeGroup(userId, role, username);
+  const homeGroup = getRegisteredGroup(homeJid);
+  if (homeGroup) {
+    registeredGroups[homeJid] = homeGroup;
+  }
+  return homeGroup ?? getUserHomeGroup(userId);
+}
+
+function ensureFeishuRouteHint(
+  senderOpenId?: string,
+  senderName?: string,
+): { userId?: string; homeFolder?: string; suppress?: boolean } {
+  if (!senderOpenId?.trim()) {
+    return { suppress: true };
+  }
+
+  try {
+    const { user, created } = findOrCreateUserByFeishuOpenId({
+      openId: senderOpenId,
+      displayName: senderName,
+    });
+    if (user.status !== 'active') {
+      logger.warn({ userId: user.id, senderOpenId }, 'Ignored Feishu message for inactive user');
+      return { suppress: true };
+    }
+
+    const homeGroup = ensureUserHomeGroupCached(user.id, user.role, user.username);
+    if (!homeGroup) {
+      logger.warn({ userId: user.id, senderOpenId }, 'Failed to resolve home group for Feishu user');
+      return { suppress: true };
+    }
+
+    if (created) {
+      if (user.role === 'admin') {
+        imManager.registerAdminUser(user.id);
+      }
+      logAuthEvent({
+        event_type: 'user_created',
+        username: user.username,
+        actor_username: 'feishu_im',
+        details: {
+          source: 'feishu_im',
+          role: user.role,
+          feishu_open_id: senderOpenId,
+        },
+      });
+    }
+
+    return {
+      userId: user.id,
+      homeFolder: homeGroup.folder,
+    };
+  } catch (err) {
+    logger.error({ err, senderOpenId }, 'Failed to resolve Feishu message owner');
+    return { suppress: true };
+  }
+}
+
+function buildResolveSharedFeishuRouteHint(): (context: {
+  chatJid: string;
+  chatType?: string;
+  senderOpenId?: string;
+  senderName?: string;
+}) => { userId?: string; homeFolder?: string; suppress?: boolean } | null {
+  return ({ chatJid, chatType, senderOpenId, senderName }) => {
+    if (chatType && chatType !== 'p2p') {
+      const existing = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+      if (existing?.created_by) {
+        const ownerHome = getUserHomeGroup(existing.created_by);
+        if (ownerHome) {
+          return {
+            userId: existing.created_by,
+            homeFolder: ownerHome.folder,
+          };
+        }
+      }
+    }
+
+    return ensureFeishuRouteHint(senderOpenId, senderName);
+  };
+}
+
+function buildOnNewChat(
+  userId: string,
+  homeFolder: string,
+): (
+  chatJid: string,
+  chatName: string,
+  routeHint?: { userId: string; homeFolder: string },
+) => void {
+  return (chatJid, chatName, routeHint) => {
+    const resolvedUserId = routeHint?.userId || userId;
+    const resolvedHomeFolder = routeHint?.homeFolder || homeFolder;
+    const existing = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    if (existing && !registeredGroups[chatJid]) {
+      registeredGroups[chatJid] = existing;
+    }
     if (existing) {
-      // Already owned by this user — nothing to do
-      if (existing.created_by === userId) return;
+      let changed = false;
+      if (chatName && existing.name !== chatName) {
+        existing.name = chatName;
+        changed = true;
+      }
+
+      if (!resolvedUserId || !resolvedHomeFolder) {
+        if (changed) {
+          setRegisteredGroup(chatJid, existing);
+          registeredGroups[chatJid] = existing;
+        }
+        return;
+      }
+
+      // Already owned by this user — nothing else to do
+      if (existing.created_by === resolvedUserId) {
+        if (changed) {
+          setRegisteredGroup(chatJid, existing);
+          registeredGroups[chatJid] = existing;
+        }
+        return;
+      }
 
       // Don't override groups that have target_agent_id configured
       // (manually bound IM groups routing to conversation agents)
-      if (existing.target_agent_id) return;
+      if (existing.target_agent_id) {
+        if (changed) {
+          setRegisteredGroup(chatJid, existing);
+          registeredGroups[chatJid] = existing;
+        }
+        return;
+      }
 
       // Different user's connection now owns this IM app.
       // Re-route the chat to the current user's home folder.
@@ -2245,24 +2385,40 @@ function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, c
       if (!existing.is_home) {
         const previousFolder = existing.folder;
         const previousOwner = existing.created_by;
-        existing.folder = homeFolder;
-        existing.created_by = userId;
+        existing.folder = resolvedHomeFolder;
+        existing.created_by = resolvedUserId;
         setRegisteredGroup(chatJid, existing);
         registeredGroups[chatJid] = existing;
         logger.info(
-          { chatJid, chatName, userId, homeFolder, previousFolder, previousOwner },
+          {
+            chatJid,
+            chatName,
+            userId: resolvedUserId,
+            homeFolder: resolvedHomeFolder,
+            previousFolder,
+            previousOwner,
+          },
           'Re-routed IM chat to new user (IM credentials transferred)',
         );
       }
       return;
     }
+
+    if (!resolvedUserId || !resolvedHomeFolder) {
+      logger.debug({ chatJid, chatName }, 'Skip IM chat registration without resolved owner');
+      return;
+    }
+
     registerGroup(chatJid, {
       name: chatName,
-      folder: homeFolder,
+      folder: resolvedHomeFolder,
       added_at: new Date().toISOString(),
-      created_by: userId,
+      created_by: resolvedUserId,
     });
-    logger.info({ chatJid, chatName, userId, homeFolder }, 'Auto-registered IM chat');
+    logger.info(
+      { chatJid, chatName, userId: resolvedUserId, homeFolder: resolvedHomeFolder },
+      'Auto-registered IM chat',
+    );
   };
 }
 
@@ -2359,10 +2515,6 @@ async function connectUserIMChannels(
   ignoreMessagesBefore?: number,
 ): Promise<{ feishu: boolean; telegram: boolean }> {
   const onNewChat = buildOnNewChat(userId, homeFolder);
-  const resolveGroupFolder = (chatJid: string): string | undefined => {
-    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-    return group?.folder;
-  };
   const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
   const onAgentMessage = buildOnAgentMessage();
   const onBotAddedToGroup = buildOnNewChat(userId, homeFolder); // reuse same logic: auto-register
@@ -2374,7 +2526,7 @@ async function connectUserIMChannels(
     feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, {
       ignoreMessagesBefore,
       onCommand: handleCommand,
-      resolveGroupFolder,
+      resolveGroupFolder: resolveGroupFolderForIm,
       resolveEffectiveChatJid,
       onAgentMessage,
       onBotAddedToGroup,
@@ -2383,7 +2535,15 @@ async function connectUserIMChannels(
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
-    telegram = await imManager.connectUserTelegram(userId, telegramConfig, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand, resolveGroupFolder);
+    telegram = await imManager.connectUserTelegram(
+      userId,
+      telegramConfig,
+      onNewChat,
+      buildIsChatAuthorized(userId),
+      buildOnPairAttempt(userId),
+      handleCommand,
+      resolveGroupFolderForIm,
+    );
   }
 
   return { feishu, telegram };
@@ -2609,30 +2769,35 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Reload Feishu connection for a specific user (hot-reload on config save)
-  const reloadFeishuConnection = async (config: { appId: string; appSecret: string; enabled?: boolean }): Promise<boolean> => {
-    // Find admin user's home folder (legacy global config routes to admin)
-    const adminUsers = listUsers({ status: 'active', role: 'admin', page: 1, pageSize: 1 }).users;
-    const adminUser = adminUsers[0];
-    if (!adminUser) {
-      logger.warn('No admin user found for Feishu reload');
-      return false;
+  // Reload the shared Feishu connection (hot-reload on system config save)
+  const reloadFeishuConnection = async (config: {
+    appId: string;
+    appSecret: string;
+    baseUrl?: string;
+    disableGroupChat?: boolean;
+    enabled?: boolean;
+  }): Promise<boolean> => {
+    await imManager.disconnectSharedFeishu();
+    if (feishuSyncInterval) {
+      clearInterval(feishuSyncInterval);
+      feishuSyncInterval = null;
     }
 
-    // Disconnect existing admin Feishu connection
-    await imManager.disconnectUserFeishu(adminUser.id);
-    if (feishuSyncInterval) { clearInterval(feishuSyncInterval); feishuSyncInterval = null; }
-
     if (config.enabled !== false && config.appId && config.appSecret) {
-      const homeGroup = getUserHomeGroup(adminUser.id);
-      const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
-      const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, {
-        ignoreMessagesBefore: Date.now(),
-        onCommand: handleCommand,
-        onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
-        onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-      });
+      const connected = await imManager.connectSharedFeishu(
+        config,
+        buildOnNewChat('', ''),
+        {
+          ignoreMessagesBefore: Date.now(),
+          onCommand: handleCommand,
+          resolveGroupFolder: resolveGroupFolderForIm,
+          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+          onAgentMessage: buildOnAgentMessage(),
+          resolveRouteHint: buildResolveSharedFeishuRouteHint(),
+          onBotAddedToGroup: buildOnNewChat('', ''),
+          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        },
+      );
       if (connected) {
         syncGroupMetadata().catch((err) =>
           logger.error({ err }, 'Group sync after Feishu reconnect failed'),
@@ -2740,7 +2905,7 @@ async function main(): Promise<void> {
     reloadFeishuConnection,
     reloadTelegramConnection,
     reloadUserIMConfig,
-    isFeishuConnected: () => imManager.isAnyFeishuConnected(),
+    isFeishuConnected: () => imManager.isSharedFeishuConnected(),
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
     isUserFeishuConnected: (userId: string) => imManager.isFeishuConnected(userId),
     isUserTelegramConnected: (userId: string) => imManager.isTelegramConnected(userId),
@@ -2858,8 +3023,7 @@ async function main(): Promise<void> {
   recoverPendingMessages();
   startMessageLoop();
 
-  // --- IM Connection Pool: connect per-user IM channels ---
-  // Load global IM config (backward compat: used for admin if no per-user config exists)
+  // --- IM Connection Pool: connect shared + per-user IM channels ---
   const globalFeishuConfig = getFeishuProviderConfigWithSource();
   const globalTelegramConfig = getTelegramProviderConfigWithSource();
 
@@ -2882,21 +3046,48 @@ async function main(): Promise<void> {
 
   let anyFeishuConnected = false;
 
+  if (
+    globalFeishuConfig.source !== 'none'
+    && globalFeishuConfig.config.enabled !== false
+    && globalFeishuConfig.config.appId
+    && globalFeishuConfig.config.appSecret
+  ) {
+    try {
+      anyFeishuConnected = await imManager.connectSharedFeishu(
+        globalFeishuConfig.config,
+        buildOnNewChat('', ''),
+        {
+          onCommand: handleCommand,
+          resolveGroupFolder: resolveGroupFolderForIm,
+          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+          onAgentMessage: buildOnAgentMessage(),
+          resolveRouteHint: buildResolveSharedFeishuRouteHint(),
+          onBotAddedToGroup: buildOnNewChat('', ''),
+          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        },
+      );
+      logger.info({ connected: anyFeishuConnected }, 'Shared Feishu channel initialized');
+    } catch (err) {
+      logger.error({ err }, 'Failed to connect shared Feishu channel');
+    }
+  }
+
   for (const user of allActiveUsers) {
     const homeGroup = getUserHomeGroup(user.id);
     if (!homeGroup) continue;
 
-    // Per-user IM config takes precedence; fall back to global config for admin
+    // Per-user IM config
     const userFeishu = getUserFeishuConfig(user.id);
     const userTelegram = getUserTelegramConfig(user.id);
 
-    // Determine effective Feishu config: per-user > global (admin only)
+    // Determine effective Feishu config: per-user only
     let effectiveFeishu: FeishuConnectConfig | null = null;
     if (userFeishu && userFeishu.appId && userFeishu.appSecret) {
-      effectiveFeishu = { appId: userFeishu.appId, appSecret: userFeishu.appSecret, enabled: userFeishu.enabled };
-    } else if (user.role === 'admin' && globalFeishuConfig.source !== 'none') {
-      const gc = globalFeishuConfig.config;
-      effectiveFeishu = { appId: gc.appId, appSecret: gc.appSecret, enabled: gc.enabled };
+      effectiveFeishu = {
+        appId: userFeishu.appId,
+        appSecret: userFeishu.appSecret,
+        enabled: userFeishu.enabled,
+      };
     }
 
     // Determine effective Telegram config: per-user > global (admin only)

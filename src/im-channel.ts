@@ -20,7 +20,11 @@ import { logger } from './logger.js';
 
 export interface IMChannelConnectOpts {
   onReady: () => void;
-  onNewChat: (chatJid: string, chatName: string) => void;
+  onNewChat: (
+    chatJid: string,
+    chatName: string,
+    routeHint?: { userId: string; homeFolder: string },
+  ) => void;
   onMessage?: (chatJid: string, text: string, senderName: string) => void;
   ignoreMessagesBefore?: number;
   isChatAuthorized?: (jid: string) => boolean;
@@ -33,6 +37,15 @@ export interface IMChannelConnectOpts {
   resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** 共享机器人模式下，根据消息发送者决定归属用户 */
+  resolveRouteHint?: (context: {
+    chatJid: string;
+    chatType?: string;
+    senderOpenId?: string;
+    senderName?: string;
+  }) =>
+    | { userId?: string; homeFolder?: string; suppress?: boolean }
+    | null;
   /** Bot 被添加到群聊时调用 */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用 */
@@ -96,6 +109,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         resolveGroupFolder: opts.resolveGroupFolder,
         resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
         onAgentMessage: opts.onAgentMessage,
+        resolveRouteHint: opts.resolveRouteHint,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
       });

@@ -11,12 +11,14 @@ export type { GroupInfo, AgentInfo };
 export interface Message {
   id: string;
   chat_jid: string;
+  source_jid?: string;
   sender: string;
   sender_name: string;
   content: string;
   timestamp: string;
   is_from_me: boolean;
   attachments?: string;
+  token_usage?: string;
 }
 
 // Streaming event types (canonical source: shared/stream-event.ts)
@@ -49,6 +51,7 @@ export interface StreamingState {
   systemStatus: string | null;
   recentEvents: StreamingTimelineEvent[];
   todos?: Array<{ id: string; content: string; status: string }>;
+  interrupted?: boolean;
 }
 
 function mergeMessagesChronologically(
@@ -60,7 +63,7 @@ function mergeMessagesChronologically(
   // Incoming messages are authoritative, but preserve reference if content unchanged
   for (const m of incoming) {
     const old = byId.get(m.id);
-    if (!old || old.content !== m.content || old.timestamp !== m.timestamp) {
+    if (!old || old.content !== m.content || old.timestamp !== m.timestamp || old.token_usage !== m.token_usage) {
       byId.set(m.id, m);
     }
   }
@@ -137,13 +140,15 @@ interface ChatState {
   sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<void>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
-  resetSession: (jid: string) => Promise<boolean>;
+  resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
+  deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
+  togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
   handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
-  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string) => void;
+  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string, source?: string) => void;
   handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind']) => void;
   clearStreaming: (
     chatJid: string,
@@ -157,12 +162,16 @@ interface ChatState {
   // Conversation agent actions
   createConversation: (jid: string, name: string, description?: string) => Promise<AgentInfo | null>;
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
-  sendAgentMessage: (jid: string, agentId: string, content: string) => void;
+  sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => void;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
+  // Runner state sync
+  handleRunnerState: (chatJid: string, state: string) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
-  bindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
+  bindImGroup: (jid: string, agentId: string, imJid: string, force?: boolean) => Promise<boolean>;
   unbindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
+  bindMainImGroup: (jid: string, imJid: string, force?: boolean) => Promise<boolean>;
+  unbindMainImGroup: (jid: string, imJid: string) => Promise<boolean>;
 }
 
 const DEFAULT_STREAMING_STATE: StreamingState = {
@@ -176,6 +185,9 @@ const SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS = 1200;
 const SDK_TASK_STALE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes stale timeout for non-teammate tasks
 const sdkTaskCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const sdkTaskStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** 已完成/出错的 SDK Task ID，防止迟到事件 re-create */
+const completedSdkTaskIds = new Set<string>();
 
 // 兜底路由支持的事件类型（模块级常量，避免热路径上重复创建 Set）
 const FALLBACK_EVENT_TYPES: Set<StreamEventType> = new Set([
@@ -221,6 +233,21 @@ function pickSdkTaskAliasTarget(
   const createdAtMap = new Map((state.agents[chatJid] || []).map((a) => [a.id, a.created_at]));
   pool.sort((a, b) => (createdAtMap.get(a) || '').localeCompare(createdAtMap.get(b) || ''));
   return pool[0] || null;
+}
+
+function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+  if (message.sender === '__billing__') return true;
+  // query_interrupted 不再作为终端消息：中断后由 status:interrupted 流式事件冻结 UI，
+  // 再由后续 new_message（含中断文本）完成最终转换，避免提前清除 streaming 导致内容消失。
+  return message.sender === '__system__' && (
+    message.content.startsWith('agent_error:') ||
+    message.content.startsWith('agent_max_retries:') ||
+    message.content.startsWith('context_overflow:')
+  );
+}
+
+function isInterruptSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+  return message.sender === '__system__' && message.content === 'query_interrupted';
 }
 
 function clearSdkTaskCleanupTimer(taskId: string): void {
@@ -281,6 +308,7 @@ function doSdkTaskCleanup(
 ): void {
   sdkTaskCleanupTimers.delete(taskId);
   clearSdkTaskStaleTimer(taskId);
+  completedSdkTaskIds.delete(taskId);
   set((s) => {
     const isTeammate = s.sdkTasks[taskId]?.isTeammate || false;
     const nextSdkTasks = { ...s.sdkTasks };
@@ -472,6 +500,9 @@ function applyStreamEvent(
         next.todos = event.todos;
       }
       break;
+    case 'mode_change':
+      // Handled at ChatView level via onModeChange callback
+      break;
     case 'status': {
       next.systemStatus = event.statusText || null;
       if (event.statusText) {
@@ -616,15 +647,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const agentReplied = data.messages.some(
             (m) => m.is_from_me && m.sender !== '__system__',
           );
-          const hasSystemError = data.messages.some(
-            (m) => m.sender === '__system__' &&
-              (
-                m.content.startsWith('agent_error:') ||
-                m.content.startsWith('agent_max_retries:') ||
-                m.content.startsWith('context_overflow:') ||
-                m.content === 'query_interrupted'
-              )
-          );
+          const hasSystemError = data.messages.some((m) => isTerminalSystemMessage(m));
+          const hasInterruptMarker = data.messages.some((m) => isInterruptSystemMessage(m));
+          const shouldFinalizeInterrupt = hasInterruptMarker && !s.streaming[jid]?.interrupted;
 
           // Transfer pending thinking to thinkingCache
           let nextThinkingCache = s.thinkingCache;
@@ -642,10 +667,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
           return {
             messages: { ...s.messages, [jid]: merged },
-            waiting: (agentReplied || hasSystemError)
+            waiting: (agentReplied || hasSystemError || shouldFinalizeInterrupt)
               ? { ...s.waiting, [jid]: false }
               : s.waiting,
-            streaming: (agentReplied || hasSystemError)
+            streaming: (agentReplied || hasSystemError || shouldFinalizeInterrupt)
               ? (() => { const next = { ...s.streaming }; delete next[jid]; return next; })()
               : s.streaming,
             thinkingCache: nextThinkingCache,
@@ -689,16 +714,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           is_from_me: false,
           attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
         };
-        set((s) => ({
-          messages: {
-            ...s.messages,
-            [jid]: (s.messages[jid] || []).some((m) => m.id === msg.id)
-              ? (s.messages[jid] || [])
-              : [...(s.messages[jid] || []), msg],
-          },
-          waiting: { ...s.waiting, [jid]: true },
-          error: null,
-        }));
+        set((s) => {
+          const merged = mergeMessagesChronologically(
+            s.messages[jid] || [],
+            [msg],
+          );
+          const latest = merged.length > 0 ? merged[merged.length - 1] : null;
+          const shouldWait =
+            !!latest &&
+            latest.is_from_me === false &&
+            !isTerminalSystemMessage(latest);
+          return {
+            messages: {
+              ...s.messages,
+              [jid]: merged,
+            },
+            waiting: { ...s.waiting, [jid]: shouldWait },
+            error: null,
+          };
+        });
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -733,25 +767,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return false;
       }
 
-      // Agent conversation JIDs contain #agent:{agentId}
-      const agentSep = jid.indexOf('#agent:');
-      if (agentSep >= 0) {
-        const agentId = jid.slice(agentSep + 7);
-        set((s) => {
-          const nextStreaming = { ...s.agentStreaming };
-          delete nextStreaming[agentId];
-          const nextWaiting = { ...s.agentWaiting };
-          delete nextWaiting[agentId];
-          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
-        });
-      } else {
-        get().clearStreaming(jid, { preserveThinking: false });
-        set((s) => {
-          const next = { ...s.waiting };
-          delete next[jid];
-          return { waiting: next };
-        });
-      }
+      // 不主动清理流式状态和 waiting 标志。
+      // 后端的 status:interrupted 事件会冻结 UI（保留已输出文本），
+      // 随后的 new_message 事件完成最终清理（流式 → 正式消息）。
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -759,14 +777,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  resetSession: async (jid: string) => {
+  resetSession: async (jid: string, agentId?: string) => {
     try {
       await api.post<{ success: boolean; dividerMessageId: string }>(
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
+        agentId ? { agentId } : undefined,
       );
-      get().clearStreaming(jid, { preserveThinking: false });
-      // Refresh messages to pick up the divider message
-      await get().refreshMessages(jid);
+      if (agentId) {
+        // Agent-specific: clear agent streaming and refresh agent messages
+        set((s) => {
+          const nextStreaming = { ...s.agentStreaming };
+          delete nextStreaming[agentId];
+          const nextWaiting = { ...s.agentWaiting };
+          delete nextWaiting[agentId];
+          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
+        });
+        await get().loadAgentMessages(jid, agentId);
+      } else {
+        get().clearStreaming(jid, { preserveThinking: false });
+        // Refresh messages to pick up the divider message
+        await get().refreshMessages(jid);
+      }
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -822,6 +853,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  deleteMessage: async (jid: string, messageId: string) => {
+    try {
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`);
+      set((s) => ({
+        messages: {
+          ...s.messages,
+          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
+        },
+      }));
+      return true;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      return false;
+    }
+  },
+
   createFlow: async (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => {
     try {
       const body: Record<string, string> = { name };
@@ -865,6 +912,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
             },
           },
           error: null,
+        };
+      });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  togglePin: async (jid: string) => {
+    const group = get().groups[jid];
+    if (!group) return;
+    const willPin = !group.pinned_at;
+    try {
+      const data = await api.patch<{ success: boolean; pinned_at?: string }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+        { is_pinned: willPin },
+      );
+      set((s) => {
+        const g = s.groups[jid];
+        if (!g) return s;
+        return {
+          groups: {
+            ...s.groups,
+            [jid]: {
+              ...g,
+              pinned_at: willPin ? (data.pinned_at || new Date().toISOString()) : undefined,
+            },
+          },
         };
       });
     } catch (err) {
@@ -941,6 +1015,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
       set((s) => {
+        // Guard: if streaming was already cleared (agent reply received),
+        // ignore late-arriving stream events to prevent "thinking" reappearing.
+        if (!s.agentStreaming[agentId] && s.agentWaiting[agentId] === false) {
+          return s;
+        }
         const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
         const next = { ...prev };
         applyStreamEvent(event, prev, next, 8000);
@@ -1016,6 +1095,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       closeAfterMs = SDK_TASK_AUTO_CLOSE_MS,
     ) => {
       clearSdkTaskStaleTimer(taskId);
+      completedSdkTaskIds.add(taskId);
       let targetChatJid: string | null = null;
       set((s) => {
         const existingTask = s.sdkTasks[taskId];
@@ -1136,10 +1216,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const taskFromDb = (state.agents[chatJid] || []).find(a => a.id === tid && a.kind === 'task');
       const knownTask = !!state.sdkTasks[tid] || !!taskFromDb;
       if (knownTask) {
-        if (!state.sdkTasks[tid]) {
+        if (!state.sdkTasks[tid] && !completedSdkTaskIds.has(tid)) {
           ensureSdkTask(tid, taskFromDb?.prompt || taskFromDb?.name);
         }
         // Reset stale timer — task is still active
+        if (completedSdkTaskIds.has(tid)) return;
         const task = state.sdkTasks[tid];
         if (task && !task.isTeammate) {
           resetSdkTaskStaleTimer(set, get, tid, chatJid);
@@ -1189,26 +1270,104 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // fall-through 到主对话处理，移除 activeTools 中的 Task 条目
     }
 
-    // 中断事件需要在所有客户端显式收尾，避免 waiting 残留。
+    // 中断事件：冻结流式 UI（保留已输出文本），等待 new_message 完成最终转换。
     if (event.eventType === 'status' && event.statusText === 'interrupted') {
       set((s) => {
+        const streamState = s.streaming[chatJid];
         const nextStreaming = { ...s.streaming };
-        delete nextStreaming[chatJid];
+
+        const hasData = streamState && (
+          streamState.partialText ||
+          streamState.thinkingText ||
+          streamState.activeTools.length > 0 ||
+          streamState.activeHook ||
+          streamState.systemStatus ||
+          streamState.recentEvents.length > 0 ||
+          (streamState.todos && streamState.todos.length > 0)
+        );
+
+        if (hasData) {
+          // 冻结：保留所有已输出内容（文本、Reasoning、事件轨迹），
+          // 清除活跃动画指示器，标记已中断
+          nextStreaming[chatJid] = {
+            ...streamState,
+            isThinking: false,
+            activeTools: [],
+            activeHook: null,
+            systemStatus: null,
+            interrupted: true,
+          };
+        } else {
+          // 完全无输出，直接清除
+          delete nextStreaming[chatJid];
+        }
+
         const nextPendingThinking = { ...s.pendingThinking };
         delete nextPendingThinking[chatJid];
-        const nextWaiting = { ...s.waiting };
-        delete nextWaiting[chatJid];
+
         return {
-          waiting: nextWaiting,
+          waiting: { ...s.waiting, [chatJid]: false },
           streaming: nextStreaming,
           pendingThinking: nextPendingThinking,
         };
       });
+
+      // Fallback：10s 后如果 new_message 未到达，强制清除冻结状态
+      setTimeout(() => {
+        const state = get();
+        if (state.streaming[chatJid] && !state.waiting[chatJid]) {
+          set((s) => {
+            const next = { ...s.streaming };
+            delete next[chatJid];
+            return { streaming: next };
+          });
+        }
+      }, 10_000);
+
       return;
+    }
+
+    // ⑤.5 usage 事件 → 实时更新最近一条 AI 消息的 token_usage
+    if (event.eventType === 'usage' && event.usage) {
+      const usage = event.usage;
+      // 构造与 DB 中 token_usage JSON 一致的格式
+      const tokenUsageJson = JSON.stringify({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        costUSD: usage.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        modelUsage: usage.modelUsage,
+      });
+      set((s) => {
+        const msgs = s.messages[chatJid];
+        if (!msgs || msgs.length === 0) return s;
+        // 从后往前找最近一条 AI 回复
+        let targetIdx = -1;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].is_from_me) { targetIdx = i; break; }
+        }
+        if (targetIdx < 0) return s;
+        const updated = [...msgs];
+        updated[targetIdx] = { ...updated[targetIdx], token_usage: tokenUsageJson };
+        return { messages: { ...s.messages, [chatJid]: updated } };
+      });
+      // 不 return — usage 事件同时落入主对话 streaming（如需 recentEvents 展示）
     }
 
     // ⑥ 主对话 streaming — 使用 applyStreamEvent 共享函数
     set((s) => {
+      // If streaming state was already cleared (final message received),
+      // ignore late-arriving stream events to prevent "thinking" from reappearing.
+      if (!s.streaming[chatJid] && s.waiting[chatJid] === false) {
+        return s;
+      }
+      // 冻结的中断状态不接收新事件（如 usage），防止 waiting 被改回 true
+      if (s.streaming[chatJid]?.interrupted) {
+        return s;
+      }
       const MAX_STREAMING_TEXT = 8000;
       const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
@@ -1221,7 +1380,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 通过 WebSocket new_message 事件立即添加消息（避免轮询延迟导致消息"丢失"）
-  handleWsNewMessage: (chatJid, wsMsg, agentId?) => {
+  handleWsNewMessage: (chatJid, wsMsg, agentId?, source?) => {
     if (!wsMsg || !wsMsg.id) return;
     // Skip while clearHistory is in-flight to prevent race re-injection
     if (get().clearing[chatJid]) return;
@@ -1267,15 +1426,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const alreadyExists = existing.some((m) => m.id === wsMsg.id);
       const updated = alreadyExists ? existing : [...existing, msg];
 
-      const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
-      const isSystemError =
-        msg.sender === '__system__' &&
-        (msg.content.startsWith('agent_error:') ||
-          msg.content.startsWith('agent_max_retries:') ||
-          msg.content.startsWith('context_overflow:') ||
-          msg.content === 'query_interrupted');
+      const isAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task';
+      const isSystemError = isTerminalSystemMessage(msg);
+      const isInterruptMarker = isInterruptSystemMessage(msg);
+      const shouldFinalizeInterrupt = isInterruptMarker && !s.streaming[chatJid]?.interrupted;
 
-      if (isAgentReply || isSystemError) {
+      if (isAgentReply || isSystemError || shouldFinalizeInterrupt) {
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存
         const streamState = s.streaming[chatJid];
         const thinkingText = isAgentReply
@@ -1363,6 +1519,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       let nextSdkTaskAliases = { ...s.sdkTaskAliases };
       if (resolvedKind === 'task') {
         if (status !== 'running') {
+          completedSdkTaskIds.add(agentId);
           clearSdkTaskCleanupTimer(agentId);
           clearSdkTaskStaleTimer(agentId);
           delete nextSdkTasks[agentId];
@@ -1558,7 +1715,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  sendAgentMessage: (jid, agentId, content) => {
+  sendAgentMessage: (jid, agentId, content, attachments?) => {
     // Clear agent streaming state before sending
     set((s) => {
       const next = { ...s.agentStreaming };
@@ -1566,7 +1723,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { agentStreaming: next };
     });
     // Send via WebSocket with agentId
-    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId });
+    const normalizedAttachments = attachments && attachments.length > 0
+      ? attachments.map(att => ({ type: 'image' as const, ...att }))
+      : undefined;
+    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
     set((s) => ({
       agentWaiting: { ...s.agentWaiting, [agentId]: true },
     }));
@@ -1623,11 +1783,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  bindImGroup: async (jid, agentId, imJid) => {
+  bindImGroup: async (jid, agentId, imJid, force) => {
     try {
       await api.put(
         `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding`,
-        { im_jid: imJid },
+        { im_jid: imJid, ...(force ? { force: true } : {}) },
       );
       // Refresh agents to get updated linked_im_groups
       get().loadAgents(jid);
@@ -1643,6 +1803,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
       );
       get().loadAgents(jid);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  bindMainImGroup: async (jid, imJid, force) => {
+    try {
+      await api.put(
+        `/api/groups/${encodeURIComponent(jid)}/im-binding`,
+        { im_jid: imJid, ...(force ? { force: true } : {}) },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  unbindMainImGroup: async (jid, imJid) => {
+    try {
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/im-binding/${encodeURIComponent(imJid)}`,
+      );
       return true;
     } catch {
       return false;
@@ -1700,6 +1883,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  // Runner 状态同步：idle 时清理残留状态，running 时重新启用 stream event 接收
+  handleRunnerState: (chatJid, state) => {
+    if (state === 'idle') {
+      // 冻结的中断状态不清除：等 new_message 或 fallback 定时器处理
+      if (get().streaming[chatJid]?.interrupted) return;
+      get().clearStreaming(chatJid);
+    } else if (state === 'running') {
+      // 新进程启动时重新设置 waiting=true，确保 handleStreamEvent 的防重入
+      // guard（!streaming && waiting===false）不会丢弃新进程的 stream events。
+      // 典型场景：上一进程的 idle 清除了 waiting，drainGroup 立即启动新进程。
+      // 同时清除残留的冻结中断状态，防止新流式输出继承 interrupted 标志。
+      set((s) => {
+        const nextStreaming = { ...s.streaming };
+        if (nextStreaming[chatJid]?.interrupted) {
+          delete nextStreaming[chatJid];
+        }
+        return {
+          waiting: { ...s.waiting, [chatJid]: true },
+          streaming: nextStreaming,
+        };
+      });
+    }
+  },
+
   // 清除流式状态（保留仍在运行的后台 SDK Task 的 agentStreaming）
   clearStreaming: (chatJid, options) => {
     set((s) => {
@@ -1715,34 +1922,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       // 收集该 chatJid 下仍在运行的 SDK Task
-      const runningTaskIds: string[] = [];
+      const runningSet = new Set<string>();
       for (const [taskId, task] of Object.entries(s.sdkTasks)) {
         if (task.chatJid === chatJid && task.status === 'running') {
-          runningTaskIds.push(taskId);
+          runningSet.add(taskId);
         }
       }
 
-      // 有运行中的 task 时，保留其 agentStreaming，清理已结束 task 的
-      if (runningTaskIds.length > 0) {
-        const runningSet = new Set(runningTaskIds);
-        const nextAgentStreaming = { ...s.agentStreaming };
-        for (const [taskId, task] of Object.entries(s.sdkTasks)) {
-          if (task.chatJid === chatJid && !runningSet.has(taskId)) {
-            delete nextAgentStreaming[taskId];
-          }
+      // 清理已结束 task 的 agentStreaming（无论是否有运行中的 task）
+      const nextAgentStreaming = { ...s.agentStreaming };
+      let agentStreamingChanged = false;
+      for (const [taskId, task] of Object.entries(s.sdkTasks)) {
+        if (task.chatJid === chatJid && !runningSet.has(taskId) && nextAgentStreaming[taskId]) {
+          delete nextAgentStreaming[taskId];
+          agentStreamingChanged = true;
         }
-        return {
-          waiting: { ...s.waiting, [chatJid]: false },
-          streaming: next,
-          pendingThinking: nextPendingThinking,
-          agentStreaming: nextAgentStreaming,
-        };
+      }
+      // 同时清理 agents[] 中已完成的 conversation agent 的 agentStreaming
+      for (const agent of (s.agents[chatJid] || [])) {
+        if (agent.status !== 'running' && nextAgentStreaming[agent.id]) {
+          delete nextAgentStreaming[agent.id];
+          agentStreamingChanged = true;
+        }
       }
 
       return {
         waiting: { ...s.waiting, [chatJid]: false },
         streaming: next,
         pendingThinking: nextPendingThinking,
+        ...(agentStreamingChanged ? { agentStreaming: nextAgentStreaming } : {}),
       };
     });
   },

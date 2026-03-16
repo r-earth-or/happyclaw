@@ -8,6 +8,7 @@ import { SetupChannelsPage } from './pages/SetupChannelsPage';
 import { MemoryPage } from './pages/MemoryPage';
 import { SkillsPage } from './pages/SkillsPage';
 import { McpServersPage } from './pages/McpServersPage';
+import { AgentDefinitionsPage } from './pages/AgentDefinitionsPage';
 import { UsersPage } from './pages/UsersPage';
 import { AuthGuard } from './components/auth/AuthGuard';
 import { AppLayout } from './components/layout/AppLayout';
@@ -17,6 +18,8 @@ const ChatPage = lazy(() => import('./pages/ChatPage').then(m => ({ default: m.C
 const TasksPage = lazy(() => import('./pages/TasksPage').then(m => ({ default: m.TasksPage })));
 const MonitorPage = lazy(() => import('./pages/MonitorPage').then(m => ({ default: m.MonitorPage })));
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
+const UsagePage = lazy(() => import('./pages/UsagePage').then(m => ({ default: m.UsagePage })));
+const BillingPage = lazy(() => import('./pages/BillingPage'));
 
 export function App() {
   const Router = shouldUseHashRouter() ? HashRouter : BrowserRouter;
@@ -57,9 +60,12 @@ export function App() {
           <Route path="/groups" element={<Navigate to="/settings?tab=groups" replace />} />
           <Route path="/tasks" element={<Suspense fallback={null}><TasksPage /></Suspense>} />
           <Route path="/monitor" element={<Suspense fallback={null}><MonitorPage /></Suspense>} />
+          <Route path="/usage" element={<Suspense fallback={null}><UsagePage /></Suspense>} />
+          <Route path="/billing" element={<Suspense fallback={null}><BillingPage /></Suspense>} />
           <Route path="/memory" element={<MemoryPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/mcp-servers" element={<McpServersPage />} />
+          <Route path="/agent-definitions" element={<AgentDefinitionsPage />} />
           <Route path="/settings" element={<Suspense fallback={null}><SettingsPage /></Suspense>} />
           <Route
             path="/users"

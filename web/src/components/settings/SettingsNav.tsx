@@ -1,5 +1,4 @@
 import {
-  Radio,
   ShieldCheck,
   UserPlus,
   User,
@@ -8,11 +7,13 @@ import {
   BookOpen,
   Puzzle,
   Server,
+  Bot,
   UserCog,
   Info,
   Palette,
   MessageSquare,
   SlidersHorizontal,
+  Link2,
 } from 'lucide-react';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { SettingsTab } from './types';
@@ -25,7 +26,6 @@ interface NavItem {
 }
 
 const systemItems: NavItem[] = [
-  { key: 'channels', label: '系统渠道', icon: <Radio className="w-4 h-4" />, group: 'system' },
   { key: 'claude', label: 'Claude 提供商', icon: <ShieldCheck className="w-4 h-4" />, group: 'system' },
   { key: 'registration', label: '注册管理', icon: <UserPlus className="w-4 h-4" />, group: 'system' },
   { key: 'appearance', label: '外观（全局）', icon: <Palette className="w-4 h-4" />, group: 'system' },
@@ -34,7 +34,7 @@ const systemItems: NavItem[] = [
 
 const accountItems: NavItem[] = [
   { key: 'profile', label: '个人资料', icon: <User className="w-4 h-4" />, group: 'account' },
-  { key: 'my-channels', label: '我的通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
+  { key: 'my-channels', label: '消息通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
   { key: 'security', label: '安全与设备', icon: <Shield className="w-4 h-4" />, group: 'account' },
 ];
 
@@ -43,6 +43,8 @@ const featureItems: NavItem[] = [
   { key: 'memory', label: '记忆管理', icon: <BookOpen className="w-4 h-4" />, group: 'features' },
   { key: 'skills', label: '技能管理', icon: <Puzzle className="w-4 h-4" />, group: 'features' },
   { key: 'mcp-servers', label: 'MCP 服务器', icon: <Server className="w-4 h-4" />, group: 'features' },
+  { key: 'agent-definitions', label: 'Agent', icon: <Bot className="w-4 h-4" />, group: 'features' },
+  { key: 'bindings', label: 'IM 绑定', icon: <Link2 className="w-4 h-4" />, group: 'features' },
   { key: 'users', label: '用户管理', icon: <UserCog className="w-4 h-4" />, group: 'features' },
   { key: 'about', label: '关于', icon: <Info className="w-4 h-4" />, group: 'features' },
 ];

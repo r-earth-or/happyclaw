@@ -50,10 +50,16 @@ export class TerminalManager {
       // Ensure user-executable bit for node-pty helper.
       if ((stat.mode & 0o100) === 0) {
         fs.chmodSync(helperPath, stat.mode | 0o755);
-        logger.info({ helperPath }, 'Fixed node-pty spawn-helper executable bit');
+        logger.info(
+          { helperPath },
+          'Fixed node-pty spawn-helper executable bit',
+        );
       }
     } catch (err) {
-      logger.warn({ err }, 'Failed to validate node-pty spawn-helper permissions');
+      logger.warn(
+        { err },
+        'Failed to validate node-pty spawn-helper permissions',
+      );
     }
   }
 
@@ -70,7 +76,10 @@ export class TerminalManager {
       this.stop(groupJid);
     }
 
-    logger.info({ groupJid, containerName, cols, rows }, 'Starting terminal session');
+    logger.info(
+      { groupJid, containerName, cols, rows },
+      'Starting terminal session',
+    );
 
     const shellBootstrap =
       'if command -v zsh >/dev/null 2>&1; then exec zsh -il; ' +
@@ -82,7 +91,7 @@ export class TerminalManager {
     try {
       const ptyProcess = pty.spawn(
         'docker',
-        ['exec', '-it', containerName, '/bin/sh', '-lc', shellBootstrap],
+        ['exec', '-it', '-u', 'node', containerName, '/bin/sh', '-lc', shellBootstrap],
         {
           name: 'xterm-256color',
           cols,
@@ -117,7 +126,7 @@ export class TerminalManager {
       );
     }
 
-    const proc = spawn('docker', ['exec', '-i', containerName, '/bin/sh'], {
+    const proc = spawn('docker', ['exec', '-i', '-u', 'node', containerName, '/bin/sh'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,

@@ -1,33 +1,25 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, ExternalLink, KeyRound, Loader2, Link2, Plus, Server, ShieldCheck, X } from 'lucide-react';
+import { ArrowRight, Check, ExternalLink, HardDrive, KeyRound, Loader2, Link2, Plus, Server, ShieldCheck, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { api } from '../api/client';
+import type {
+  ClaudeThirdPartyProfileItem,
+  EnvRow,
+} from '../components/settings/types';
+import { getErrorMessage } from '../components/settings/types';
 import { useAuthStore } from '../stores/auth';
 
 type ProviderMode = 'official' | 'third_party';
-
-interface EnvRow {
-  key: string;
-  value: string;
-}
 
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'HAPPYCLAW_MODEL',
 ]);
-
-function getErrorMessage(err: unknown, fallback: string): string {
-  if (typeof err === 'object' && err !== null && 'message' in err) {
-    const msg = (err as { message?: unknown }).message;
-    if (typeof msg === 'string' && msg.trim()) return msg;
-  }
-  if (err instanceof Error && err.message) return err.message;
-  return fallback;
-}
 
 function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; error: string | null } {
   const customEnv: Record<string, string> = {};
@@ -68,6 +60,16 @@ export function SetupProvidersPage() {
   // Official mode
   const [officialToken, setOfficialToken] = useState('');
 
+  // Local Claude Code detection
+  const [localCC, setLocalCC] = useState<{
+    detected: boolean;
+    hasCredentials: boolean;
+    expiresAt: number | null;
+    accessTokenMasked: string | null;
+  } | null>(null);
+  const [localCCImporting, setLocalCCImporting] = useState(false);
+  const [localCCImported, setLocalCCImported] = useState(false);
+
   // OAuth flow state
   const [oauthLoading, setOauthLoading] = useState(false);
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -78,6 +80,7 @@ export function SetupProvidersPage() {
   // Third-party mode
   const [baseUrl, setBaseUrl] = useState('');
   const [authToken, setAuthToken] = useState('');
+  const [model, setModel] = useState('');
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
 
   useEffect(() => {
@@ -94,6 +97,16 @@ export function SetupProvidersPage() {
     }
   }, [setupStatus, navigate]);
 
+  // Detect local Claude Code credentials on mount
+  useEffect(() => {
+    api.get<{
+      detected: boolean;
+      hasCredentials: boolean;
+      expiresAt: number | null;
+      accessTokenMasked: string | null;
+    }>('/api/config/claude/detect-local').then(setLocalCC).catch(() => {});
+  }, []);
+
   const addCustomEnvRow = () => setCustomEnvRows((rows) => [...rows, { key: '', value: '' }]);
   const removeCustomEnvRow = (idx: number) =>
     setCustomEnvRows((rows) => rows.filter((_, i) => i !== idx));
@@ -101,6 +114,20 @@ export function SetupProvidersPage() {
     setCustomEnvRows((rows) =>
       rows.map((row, i) => (i === idx ? { ...row, [field]: value } : row)),
     );
+
+  const handleImportLocalCC = async () => {
+    setLocalCCImporting(true);
+    setError(null);
+    try {
+      await api.post('/api/config/claude/import-local');
+      setLocalCCImported(true);
+      setNotice('已导入本机 Claude Code 登录凭据。');
+    } catch (err) {
+      setError(getErrorMessage(err, '导入本机凭据失败'));
+    } finally {
+      setLocalCCImporting(false);
+    }
+  };
 
   const handleOAuthStart = async () => {
     setOauthLoading(true);
@@ -165,8 +192,8 @@ export function SetupProvidersPage() {
         return;
       }
       customEnv = envResult.customEnv;
-    } else if (!officialToken.trim() && !oauthDone) {
-      setError('官方渠道请通过一键登录或手动填写 setup-token / .credentials.json');
+    } else if (!officialToken.trim() && !oauthDone && !localCCImported) {
+      setError('官方渠道请通过一键登录、导入本机凭据或手动填写 setup-token / .credentials.json');
       return;
     }
 
@@ -176,14 +203,13 @@ export function SetupProvidersPage() {
       if (feishuAppId.trim() || feishuAppSecret.trim()) {
         const payload: Record<string, string> = { appId: feishuAppId.trim() };
         if (feishuAppSecret.trim()) payload.appSecret = feishuAppSecret.trim();
-        await api.put('/api/config/feishu', payload);
+        await api.put('/api/config/user-im/feishu', payload);
       }
 
       if (providerMode === 'official') {
-        if (oauthDone) {
-          // OAuth already saved the token via /oauth/callback — just clear base URL and custom env
+        if (oauthDone || localCCImported) {
+          // OAuth or local import already saved the credentials — just clear base URL
           await api.put('/api/config/claude', { anthropicBaseUrl: '' });
-          await api.put('/api/config/claude/custom-env', { customEnv: {} });
         } else {
           await api.put('/api/config/claude', { anthropicBaseUrl: '' });
 
@@ -222,16 +248,18 @@ export function SetupProvidersPage() {
               clearAnthropicApiKey: true,
             });
           }
-          await api.put('/api/config/claude/custom-env', { customEnv: {} });
         }
       } else {
-        await api.put('/api/config/claude', { anthropicBaseUrl: baseUrl.trim() });
-        await api.put('/api/config/claude/secrets', {
-          anthropicAuthToken: authToken.trim(),
-          clearClaudeCodeOauthToken: true,
-          clearAnthropicApiKey: true,
-        });
-        await api.put('/api/config/claude/custom-env', { customEnv });
+        await api.post<ClaudeThirdPartyProfileItem>(
+          '/api/config/claude/third-party/profiles',
+          {
+            name: '默认第三方',
+            anthropicBaseUrl: baseUrl.trim(),
+            anthropicAuthToken: authToken.trim(),
+            happyclawModel: model.trim(),
+            customEnv,
+          },
+        );
       }
 
       await checkAuth();
@@ -250,19 +278,19 @@ export function SetupProvidersPage() {
   };
 
   return (
-    <div className="h-screen bg-slate-50 overflow-y-auto p-4">
+    <div className="h-screen bg-background overflow-y-auto p-4">
       <div className="w-full max-w-4xl mx-auto space-y-5">
         <div className="text-center">
           <p className="text-xs font-semibold text-primary tracking-wider mb-2">STEP 2 / 2</p>
           <h1 className="text-2xl font-bold text-foreground mb-2">系统接入初始化</h1>
-          <p className="text-sm text-slate-600">此页面保存的是系统全局默认配置。完成后才进入正式后台。</p>
+          <p className="text-sm text-muted-foreground">此页面保存的是系统全局默认配置。完成后才进入正式后台。</p>
         </div>
 
         {error && (
-          <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm">{error}</div>
+          <div className="p-3 rounded-lg bg-error-bg border border-error/30 text-error text-sm">{error}</div>
         )}
         {notice && (
-          <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm">{notice}</div>
+          <div className="p-3 rounded-lg bg-success-bg border border-success/30 text-success text-sm">{notice}</div>
         )}
 
         <section className="bg-card rounded-xl border border-border shadow-sm p-5">
@@ -270,10 +298,10 @@ export function SetupProvidersPage() {
             <Link2 className="w-4 h-4 text-primary" />
             <h2 className="text-base font-semibold text-foreground">飞书配置（可选）</h2>
           </div>
-          <p className="text-xs text-slate-500 mb-3">首装不预填任何默认值，全部由你手动输入。</p>
+          <p className="text-xs text-muted-foreground mb-3">首装不预填任何默认值，全部由你手动输入。</p>
           <div className="grid md:grid-cols-2 gap-3">
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">App ID</label>
+              <label className="block text-sm font-medium text-foreground mb-1">App ID</label>
               <Input
                 type="text"
                 value={feishuAppId}
@@ -282,7 +310,7 @@ export function SetupProvidersPage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">App Secret</label>
+              <label className="block text-sm font-medium text-foreground mb-1">App Secret</label>
               <Input
                 type="password"
                 value={feishuAppSecret}
@@ -299,12 +327,12 @@ export function SetupProvidersPage() {
             <h2 className="text-base font-semibold text-foreground">Claude Code 配置（二选一）</h2>
           </div>
 
-          <div className="inline-flex rounded-lg border border-slate-200 p-1 bg-slate-50 mb-4">
+          <div className="inline-flex rounded-lg border border-border p-1 bg-muted mb-4">
             <button
               type="button"
               onClick={() => setProviderMode('official')}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-                providerMode === 'official' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
+                providerMode === 'official' ? 'bg-background text-primary shadow-sm' : 'text-muted-foreground'
               }`}
             >
               官方渠道
@@ -313,7 +341,7 @@ export function SetupProvidersPage() {
               type="button"
               onClick={() => setProviderMode('third_party')}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-                providerMode === 'third_party' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
+                providerMode === 'third_party' ? 'bg-background text-primary shadow-sm' : 'text-muted-foreground'
               }`}
             >
               第三方渠道
@@ -322,15 +350,45 @@ export function SetupProvidersPage() {
 
           {providerMode === 'official' ? (
             <div className="space-y-4">
+              {/* Local Claude Code detection */}
+              {localCC?.hasCredentials && (
+                <div className={`rounded-lg border p-4 space-y-3 ${
+                  localCCImported
+                    ? 'border-emerald-200 bg-emerald-50/50'
+                    : 'border-blue-200 bg-blue-50/50'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <HardDrive className="w-4 h-4 text-blue-600" />
+                    <div className="text-sm font-medium text-slate-800">
+                      检测到本机已登录 Claude Code
+                    </div>
+                  </div>
+                  <div className="text-xs text-slate-600">
+                    本机 <code className="bg-white/60 px-1 rounded">~/.claude/.credentials.json</code> 中存在有效凭据（{localCC.accessTokenMasked}），可一键导入。
+                  </div>
+                  {localCCImported ? (
+                    <div className="flex items-center gap-1.5 text-sm text-emerald-700">
+                      <Check className="w-4 h-4" />
+                      已导入，点击下方按钮完成配置。
+                    </div>
+                  ) : (
+                    <Button onClick={handleImportLocalCC} disabled={localCCImporting || saving}>
+                      {localCCImporting ? <Loader2 className="size-4 animate-spin" /> : <HardDrive className="size-4" />}
+                      导入本机凭据
+                    </Button>
+                  )}
+                </div>
+              )}
+
               {/* OAuth one-click login */}
-              <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3">
-                <div className="text-sm font-medium text-slate-800">一键登录 Claude（推荐）</div>
-                <div className="text-xs text-slate-600">
+              <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 space-y-3">
+                <div className="text-sm font-medium text-foreground">一键登录 Claude（推荐）</div>
+                <div className="text-xs text-muted-foreground">
                   点击按钮后会打开 claude.ai 授权页面，完成授权后将页面上显示的授权码粘贴回来。
                 </div>
 
                 {oauthDone ? (
-                  <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2">
+                  <div className="text-sm bg-success-bg border border-success/30 text-success rounded-md px-3 py-2">
                     OAuth 登录成功，点击下方按钮完成配置。
                   </div>
                 ) : !oauthState ? (
@@ -340,7 +398,7 @@ export function SetupProvidersPage() {
                   </Button>
                 ) : (
                   <div className="space-y-2">
-                    <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                    <div className="text-xs bg-warning-bg border border-warning/30 text-warning rounded-md px-3 py-2">
                       授权窗口已打开，请在 claude.ai 完成授权后，将页面上显示的授权码粘贴到下方。
                     </div>
                     <div className="flex gap-2">
@@ -364,19 +422,19 @@ export function SetupProvidersPage() {
                 )}
               </div>
 
-              <div className="relative flex items-center gap-3 text-xs text-slate-400">
-                <div className="flex-1 border-t border-slate-200" />
+              <div className="relative flex items-center gap-3 text-xs text-muted-foreground">
+                <div className="flex-1 border-t border-border" />
                 或手动粘贴 setup-token
-                <div className="flex-1 border-t border-slate-200" />
+                <div className="flex-1 border-t border-border" />
               </div>
 
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+              <div className="rounded-lg border border-border bg-muted p-3 text-sm text-foreground">
                 <div className="font-medium mb-2">获取凭据</div>
-                <ol className="list-decimal ml-5 space-y-1 text-xs">
+                <ol className="list-decimal ml-5 space-y-1 text-xs text-muted-foreground">
                   <li>在目标机器安装 Claude Code CLI（若未安装）。</li>
                   <li>在终端执行 <code>claude login</code> 完成账号登录。</li>
                   <li>
-                    方式 A：执行 <code>cat ~/.claude/.credentials.json</code>，复制完整 JSON 内容到下方（推荐，支持自动续期）。
+                    方式 A：执行 <code>cat ~/.claude/.credentials.json</code>，复制完整 JSON 内容到下方（推荐）。
                   </li>
                   <li>
                     方式 B：执行 <code>claude setup-token</code>，复制输出 token 到下方。
@@ -385,7 +443,7 @@ export function SetupProvidersPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">
+                <label className="block text-sm font-medium text-foreground mb-1">
                   setup-token 或 .credentials.json
                 </label>
                 <Input
@@ -394,21 +452,21 @@ export function SetupProvidersPage() {
                   onChange={(e) => setOfficialToken(e.target.value)}
                   placeholder="粘贴 setup-token 或 cat ~/.claude/.credentials.json 输出"
                 />
-                <p className="text-xs text-slate-400 mt-1">
-                  支持粘贴 <code className="bg-slate-100 px-1 rounded">cat ~/.claude/.credentials.json</code> 的 JSON 内容（含自动续期）
+                <p className="text-xs text-muted-foreground mt-1">
+                  支持粘贴 <code className="bg-muted px-1 rounded">cat ~/.claude/.credentials.json</code> 的 JSON 内容
                 </p>
               </div>
             </div>
           ) : (
             <div className="space-y-4">
-              <div className="flex items-center gap-2 text-xs text-slate-500">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <Server className="w-4 h-4 text-primary" />
                 第三方渠道会写入系统全局默认环境变量。必填项为 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN。
               </div>
 
               <div className="grid grid-cols-1 gap-3">
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">ANTHROPIC_BASE_URL（必填）</label>
+                  <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_BASE_URL（必填）</label>
                   <Input
                     type="text"
                     value={baseUrl}
@@ -418,7 +476,18 @@ export function SetupProvidersPage() {
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">ANTHROPIC_AUTH_TOKEN（必填）</label>
+                  <label className="block text-sm font-medium text-foreground mb-1">HAPPYCLAW_MODEL（可选）</label>
+                  <Input
+                    type="text"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    placeholder="opus / sonnet / haiku 或完整模型 ID"
+                    className="font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_AUTH_TOKEN（必填）</label>
                   <Input
                     type="password"
                     value={authToken}
@@ -428,9 +497,9 @@ export function SetupProvidersPage() {
                 </div>
               </div>
 
-              <div className="border-t border-slate-100 pt-4">
+              <div className="border-t border-border pt-4">
                 <div className="flex items-center justify-between mb-2">
-                  <label className="text-xs text-slate-600">其他自定义环境变量（可选）</label>
+                  <label className="text-xs text-muted-foreground">其他自定义环境变量（可选）</label>
                   <button
                     type="button"
                     onClick={addCustomEnvRow}
@@ -440,9 +509,12 @@ export function SetupProvidersPage() {
                     添加
                   </button>
                 </div>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  这些变量属于系统全局设置，后续切换第三方配置时不会跟随切换。
+                </p>
 
                 {customEnvRows.length === 0 ? (
-                  <p className="text-xs text-slate-400">暂无</p>
+                  <p className="text-xs text-muted-foreground">暂无</p>
                 ) : (
                   <div className="space-y-2">
                     {customEnvRows.map((row, idx) => (
@@ -464,7 +536,7 @@ export function SetupProvidersPage() {
                         <button
                           type="button"
                           onClick={() => removeCustomEnvRow(idx)}
-                          className="w-8 h-8 rounded-md hover:bg-slate-100 text-slate-400 hover:text-red-500 flex items-center justify-center cursor-pointer"
+                          className="w-8 h-8 rounded-md hover:bg-muted text-muted-foreground hover:text-error flex items-center justify-center cursor-pointer"
                           aria-label="删除环境变量"
                         >
                           <X className="w-4 h-4" />
@@ -479,7 +551,7 @@ export function SetupProvidersPage() {
         </section>
 
         <div className="bg-card rounded-xl border border-border shadow-sm p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-          <div className="text-sm text-slate-600 flex items-start gap-2">
+          <div className="text-sm text-muted-foreground flex items-start gap-2">
             <ShieldCheck className="w-4 h-4 text-primary mt-0.5 shrink-0" />
             当前页保存的数据会作为系统全局默认配置，后续可在后台设置页继续修改。
           </div>

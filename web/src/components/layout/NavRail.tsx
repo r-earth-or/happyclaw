@@ -1,20 +1,24 @@
+import { useMemo, useState } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { MessageSquare, Clock, Activity, Settings, LogOut } from 'lucide-react';
+import { LogOut, Bug } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth';
+import { useBillingStore } from '../../stores/billing';
 import { EmojiAvatar } from '../common/EmojiAvatar';
+import { BugReportDialog } from '../common/BugReportDialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-
-const navItems = [
-  { path: '/chat', icon: MessageSquare, label: '工作台' },
-  { path: '/tasks', icon: Clock, label: '任务' },
-  { path: '/monitor', icon: Activity, label: '监控' },
-  { path: '/settings', icon: Settings, label: '设置' },
-];
+import { baseNavItems } from './nav-items';
 
 export function NavRail() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const navigate = useNavigate();
+  const billingEnabled = useBillingStore((s) => s.billingEnabled);
+  const [showBugReport, setShowBugReport] = useState(false);
+
+  const navItems = useMemo(
+    () => baseNavItems.filter((item) => !item.requiresBilling || billingEnabled),
+    [billingEnabled],
+  );
 
   const userInitial = (user?.display_name || user?.username || '?')[0].toUpperCase();
 
@@ -56,6 +60,22 @@ export function NavRail() {
 
         {/* Spacer */}
         <div className="flex-1" />
+
+        {/* Bug report */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              onClick={() => setShowBugReport(true)}
+              className="w-9 h-9 rounded-lg flex items-center justify-center text-muted-foreground hover:text-amber-600 hover:bg-amber-50 transition-colors"
+            >
+              <Bug className="w-4 h-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            报告问题
+          </TooltipContent>
+        </Tooltip>
+        <BugReportDialog open={showBugReport} onClose={() => setShowBugReport(false)} />
 
         {/* User avatar + logout */}
         <div className="flex flex-col items-center gap-1.5 mb-1">

@@ -47,6 +47,14 @@ import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
+import agentDefinitionsRoutes from './routes/agent-definitions.js';
+import { usage as usageRoutes } from './routes/usage.js';
+import billingRoutes from './routes/billing.js';
+import bugReportRoutes from './routes/bug-report.js';
+import {
+  checkBillingAccess,
+  formatBillingAccessDeniedMessage,
+} from './billing.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -60,6 +68,7 @@ import {
   getGroupMembers,
   getAgent,
   isGroupShared,
+  getUserById,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -70,7 +79,7 @@ import type {
   StreamEvent,
   UserRole,
 } from './types.js';
-import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
+import { WEB_PORT, SESSION_COOKIE_NAME, ASSISTANT_NAME } from './config.js';
 import { logger } from './logger.js';
 import { analyzeIntent } from './intent-analyzer.js';
 import { executeSessionReset } from './commands.js';
@@ -158,8 +167,12 @@ app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
+app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api', monitorRoutes);
+app.route('/api/usage', usageRoutes);
+app.route('/api/billing', billingRoutes);
+app.route('/api/bug-report', bugReportRoutes);
 
 // --- POST /api/messages ---
 
@@ -271,6 +284,39 @@ async function handleWebUserMessage(
     attachments: attachmentsStr,
   });
 
+  if (group.created_by) {
+    const owner = getUserById(group.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccess(group.created_by, owner.role);
+      if (!accessResult.allowed) {
+        const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+        const sysMsgId = `sys_quota_${Date.now()}`;
+        const sysTimestamp = new Date().toISOString();
+        storeMessageDirect(
+          sysMsgId,
+          chatJid,
+          '__billing__',
+          ASSISTANT_NAME,
+          sysMsg,
+          sysTimestamp,
+          true,
+        );
+        broadcastNewMessage(chatJid, {
+          id: sysMsgId,
+          chat_jid: chatJid,
+          sender: '__billing__',
+          sender_name: ASSISTANT_NAME,
+          content: sysMsg,
+          timestamp: sysTimestamp,
+          is_from_me: true,
+        });
+        deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+        deps.advanceGlobalCursor({ timestamp, id: messageId });
+        return { ok: true, messageId, timestamp };
+      }
+    }
+  }
+
   const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages(
     [
@@ -286,57 +332,38 @@ async function handleWebUserMessage(
     shared,
   );
 
-  // For home chat, distinguish safe reuse vs restart scenarios:
-  // - User-specific Web home with its own active runner: safe to IPC-inject
-  // - IM-started runner / shared admin home / no active runner: restart so routing and ownership are recalculated
+  // IPC-inject the message into the running agent process.  For home groups,
+  // the reply route is dynamically updated via activeRouteUpdaters so we no
+  // longer need to kill and restart the process (#99).
   let pipedToActive = false;
-  if (group.is_home) {
-    // web:main is a shared admin home. Its runtime owner is selected from the
-    // latest sender during processGroupMessages, so reusing an existing runner
-    // here can leak another admin's session/memory context.
-    const canReuseHomeRunner = chatJid !== 'web:main' && deps.queue.hasDirectActiveRunner(chatJid);
-    if (canReuseHomeRunner) {
-      // Same channel: container was started by this Web JID → IPC inject
-      const images = attachments?.map((attachment) => ({
-        data: attachment.data,
-        mimeType: attachment.mimeType,
-      }));
-      const intent = analyzeIntent(content);
-      const sendResult = deps.queue.sendMessage(chatJid, formatted, images, intent);
-      if (sendResult === 'sent' || sendResult === 'interrupted_stop' || sendResult === 'interrupted_correction') {
-        pipedToActive = true;
-      } else {
-        // Runner exited between hasDirectActiveRunner check and sendMessage (TOCTOU race).
-        // Message is already in DB — enqueueMessageCheck will pick it up.
-        logger.debug({ chatJid, sendResult }, 'Home same-channel IPC missed, falling back to enqueue');
-        deps.queue.enqueueMessageCheck(chatJid);
-      }
-    } else {
-      // Unsafe to reuse (cross-channel, shared admin home, or no active runner):
-      // keep original closeStdin + restart behavior.
-      deps.queue.closeStdin(chatJid);
-      deps.queue.enqueueMessageCheck(chatJid);
-    }
+  const images = toAgentImages(normalizedAttachments);
+  const intent = analyzeIntent(content);
+  const updateRoute = deps.updateReplyRoute;
+  const sendResult = deps.queue.sendMessage(
+    chatJid,
+    formatted,
+    images,
+    intent,
+    () => {
+      // IPC write succeeded — update reply route for home groups.
+      // Web messages have no IM source, so clear the IM route.
+      updateRoute?.(group.folder, null);
+    },
+  );
+  if (sendResult === 'sent') {
+    pipedToActive = true;
+  } else if (sendResult === 'interrupted_stop') {
+    // Stop intent: cursor updated, no enqueue needed
+    pipedToActive = true;
+  } else if (sendResult === 'interrupted_correction') {
+    // Correction intent: IPC message written, agent handles it after interrupt
+    pipedToActive = true;
+  } else if (sendResult === 'queued') {
+    // Message queued for next container run; don't advance cursor so
+    // processGroupMessages re-reads it from DB. Drain sentinel already
+    // written — the current runner will exit and drainGroup picks it up.
   } else {
-    const images = toAgentImages(normalizedAttachments);
-    const intent = analyzeIntent(content);
-    const sendResult = deps.queue.sendMessage(
-      chatJid,
-      formatted,
-      images,
-      intent,
-    );
-    if (sendResult === 'sent') {
-      pipedToActive = true;
-    } else if (sendResult === 'interrupted_stop') {
-      // Stop intent: cursor updated, no enqueue needed
-      pipedToActive = true;
-    } else if (sendResult === 'interrupted_correction') {
-      // Correction intent: IPC message written, agent handles it after interrupt
-      pipedToActive = true;
-    } else {
-      deps.queue.enqueueMessageCheck(chatJid);
-    }
+    deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
@@ -456,12 +483,16 @@ async function handleAgentConversationMessage(
 // --- Static Files ---
 
 // 带 content hash 的静态资源：长期不可变缓存
-app.use('/assets/*', async (c, next) => {
-  await next();
-  if (c.res.status === 200) {
-    c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  }
-}, serveStatic({ root: './web/dist' }));
+app.use(
+  '/assets/*',
+  async (c, next) => {
+    await next();
+    if (c.res.status === 200) {
+      c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  },
+  serveStatic({ root: './web/dist' }),
+);
 
 // SPA fallback：index.html / sw.js 等必须每次验证
 app.use(
@@ -471,8 +502,16 @@ app.use(
     if (c.res.status === 200) {
       const p = c.req.path;
       // 非文件扩展名路径（SPA fallback → index.html）、SW 脚本、manifest 禁止缓存
-      if (!p.match(/\.\w+$/) || p === '/sw.js' || p === '/registerSW.js' || p === '/manifest.webmanifest') {
-        c.res.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+      if (
+        !p.match(/\.\w+$/) ||
+        p === '/sw.js' ||
+        p === '/registerSW.js' ||
+        p === '/manifest.webmanifest'
+      ) {
+        c.res.headers.set(
+          'Cache-Control',
+          'no-cache, no-store, must-revalidate',
+        );
       }
     }
   },
@@ -528,12 +567,6 @@ function setupWebSocket(server: any): WebSocketServer {
       socket.destroy();
       return;
     }
-    if (session.must_change_password) {
-      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-
     request.__happyclawSessionId = token;
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -571,8 +604,7 @@ function setupWebSocket(server: any): WebSocketServer {
         if (
           !session ||
           isSessionExpired(session.expires_at) ||
-          session.status !== 'active' ||
-          session.must_change_password
+          session.status !== 'active'
         ) {
           if (session && isSessionExpired(session.expires_at)) {
             deleteUserSession(sessionId);
@@ -595,6 +627,11 @@ function setupWebSocket(server: any): WebSocketServer {
 
         const msg: WsMessageIn = JSON.parse(data.toString());
 
+        const sendWsError = (error: string, chatJid?: string) => {
+          const msg: WsMessageOut = { type: 'ws_error', error, chatJid };
+          ws.send(JSON.stringify(msg));
+        };
+
         if (msg.type === 'send_message') {
           const wsValidation = MessageCreateSchema.safeParse({
             chatJid: msg.chatJid,
@@ -602,6 +639,11 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments: msg.attachments,
           });
           if (!wsValidation.success) {
+            sendWsError('消息格式无效', msg.chatJid);
+            logger.warn(
+              { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
+              'WebSocket send_message validation failed',
+            );
             return;
           }
           const { chatJid, content, attachments } = wsValidation.data;
@@ -616,6 +658,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 targetGroup,
               )
             ) {
+              sendWsError('无权访问该群组', chatJid);
               logger.warn(
                 { chatJid, userId: session.user_id },
                 'WebSocket send_message blocked: access denied',
@@ -624,6 +667,7 @@ function setupWebSocket(server: any): WebSocketServer {
             }
             if (isHostExecutionGroup(targetGroup)) {
               if (session.role !== 'admin') {
+                sendWsError('宿主机模式需要管理员权限', chatJid);
                 logger.warn(
                   { chatJid, userId: session.user_id },
                   'WebSocket send_message blocked: host mode requires admin',
@@ -655,6 +699,7 @@ function setupWebSocket(server: any): WebSocketServer {
                   queue: deps.queue,
                   sessions: deps.getSessions(),
                   broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
                 });
               } catch (err) {
                 logger.error({ chatJid, err }, '/clear command failed');
@@ -1012,8 +1057,7 @@ function safeBroadcast(
     const invalid =
       !session ||
       expired ||
-      session.status !== 'active' ||
-      session.must_change_password;
+      session.status !== 'active';
     if (invalid) {
       if (expired) {
         deleteUserSession(clientInfo.sessionId);
@@ -1172,6 +1216,7 @@ export function broadcastNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
   agentId?: string,
+  source?: string,
 ): void {
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
@@ -1188,6 +1233,7 @@ export function broadcastNewMessage(
     chatJid: jid,
     message: { ...msg, is_from_me: msg.is_from_me ?? false },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+    ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
@@ -1215,6 +1261,20 @@ export function broadcastStreamEvent(
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
 
+export function broadcastBillingUpdate(
+  userId: string,
+  usage: import('./types.js').BillingAccessResult,
+): void {
+  const msg: WsMessageOut = {
+    type: 'billing_update',
+    userId,
+    usage,
+  };
+  // Send only to the specific user
+  const allowedUserIds = new Set([userId]);
+  safeBroadcast(msg, false, allowedUserIds);
+}
+
 export function broadcastAgentStatus(
   chatJid: string,
   agentId: string,
@@ -1237,6 +1297,20 @@ export function broadcastAgentStatus(
     name,
     prompt,
     resultSummary,
+  };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastRunnerState(
+  chatJid: string,
+  state: 'idle' | 'running',
+): void {
+  const jid = normalizeHomeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const msg: WsMessageOut = {
+    type: 'runner_state',
+    chatJid: jid,
+    state,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
@@ -1316,6 +1390,9 @@ export function startWebServer(webDeps: WebDeps): void {
       }
     }
   });
+
+  // Register runner state change callback for sidebar indicators
+  webDeps.queue.setOnRunnerStateChange(broadcastRunnerState);
 
   // Broadcast status every 5 seconds
   if (statusInterval) clearInterval(statusInterval);

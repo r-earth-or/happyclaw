@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Plus, PanelLeftClose } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useGroupsStore } from '../../stores/groups';
 import { Button } from '@/components/ui/button';
 import { SearchInput } from '@/components/common';
 import { ConfirmDialog } from '@/components/common';
@@ -62,6 +63,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
     loading,
     deleteFlow,
     clearHistory,
+    togglePin,
   } = useChatStore();
   const navigate = useNavigate();
 
@@ -92,24 +94,30 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
     return { mainGroup: main, otherGroups: others };
   }, [groups]);
 
-  // Split non-main groups into private / collaborative, then sub-group by date
-  const { mySections, collabSections } = useMemo(() => {
+  // Split non-main groups into pinned / private / collaborative, then sub-group by date
+  const { pinnedGroups, mySections, collabSections } = useMemo(() => {
     const filtered = searchQuery.trim()
       ? otherGroups.filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
       : otherGroups;
 
+    const pinned: typeof otherGroups = [];
     const my: typeof otherGroups = [];
     const collab: typeof otherGroups = [];
 
     filtered.forEach((g) => {
-      if (g.is_shared && (g.member_count ?? 0) >= 2) {
+      if (g.pinned_at) {
+        pinned.push(g);
+      } else if (g.is_shared && (g.member_count ?? 0) >= 2) {
         collab.push(g);
       } else {
         my.push(g);
       }
     });
 
-    return { mySections: groupByDate(my), collabSections: groupByDate(collab) };
+    // Sort pinned by pinned_at ascending (earliest pinned first = stable top)
+    pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
+
+    return { pinnedGroups: pinned, mySections: groupByDate(my), collabSections: groupByDate(collab) };
   }, [otherGroups, searchQuery]);
 
   const handleGroupSelect = (jid: string, folder: string) => {
@@ -119,6 +127,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
 
   const appearance = useAuthStore((s) => s.appearance);
   const appName = appearance?.appName || 'HappyClaw';
+  const runnerStates = useGroupsStore((s) => s.runnerStates);
 
   const handleCreated = (jid: string, folder: string) => {
     selectGroup(jid);
@@ -184,12 +193,14 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
             memberCount={showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid}
             isHome={false}
+            isRunning={runnerStates[g.jid] === 'running'}
             editable={g.editable}
             deletable={g.deletable}
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
             onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onTogglePin={(jid) => togglePin(jid)}
           />
         ))}
       </div>
@@ -257,6 +268,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
                   executionMode={mainGroup.execution_mode}
                   isActive={currentGroup === mainGroup.jid}
                   isHome
+                  isRunning={runnerStates[mainGroup.jid] === 'running'}
                   editable
                   onSelect={handleGroupSelect}
                   onRename={(jid, name) => setRenameState({ open: true, jid, name })}
@@ -265,8 +277,43 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
               </div>
             )}
 
+            {/* Section: Pinned workspaces */}
+            {pinnedGroups.length > 0 && (
+              <div className="mb-1">
+                <div className="px-2 pt-3 pb-1.5">
+                  <span className="text-[11px] font-bold text-muted-foreground uppercase tracking-wider">
+                    已固定
+                  </span>
+                </div>
+                {pinnedGroups.map((g) => (
+                  <ChatGroupItem
+                    key={g.jid}
+                    jid={g.jid}
+                    name={g.name}
+                    folder={g.folder}
+                    lastMessage={g.lastMessage}
+                    executionMode={g.execution_mode}
+                    isShared={g.is_shared}
+                    memberRole={g.member_role}
+                    memberCount={g.member_count}
+                    isActive={currentGroup === g.jid}
+                    isHome={false}
+                    isPinned
+                    isRunning={runnerStates[g.jid] === 'running'}
+                    editable={g.editable}
+                    deletable={g.deletable}
+                    onSelect={handleGroupSelect}
+                    onRename={(jid, name) => setRenameState({ open: true, jid, name })}
+                    onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
+                    onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+                    onTogglePin={(jid) => togglePin(jid)}
+                  />
+                ))}
+              </div>
+            )}
+
             {/* Section: My workspaces + Collaborative workspaces */}
-            {mySections.length === 0 && collabSections.length === 0 && !mainGroup ? (
+            {mySections.length === 0 && collabSections.length === 0 && pinnedGroups.length === 0 && !mainGroup ? (
               <div className="flex flex-col items-center justify-center h-32 px-4">
                 <p className="text-sm text-muted-foreground text-center">
                   {searchQuery ? '未找到匹配的工作区' : '暂无工作区'}

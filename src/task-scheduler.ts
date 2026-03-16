@@ -22,6 +22,7 @@ import {
   cleanupOldTaskRunLogs,
   getDueTasks,
   getTaskById,
+  getUserById,
   logTaskRun,
   updateTaskAfterRun,
 } from './db.js';
@@ -29,6 +30,7 @@ import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -41,7 +43,11 @@ export interface SchedulerDependencies {
     groupFolder: string,
     displayName?: string,
   ) => void;
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    options?: { source?: string },
+  ) => Promise<string | undefined | void>;
   assistantName: string;
   dailySummaryDeps?: DailySummaryDeps;
 }
@@ -56,7 +62,9 @@ function computeNextRun(task: ScheduledTask): string | null {
     return interval.next().toISOString();
   } else if (task.schedule_type === 'interval') {
     const ms = parseInt(task.schedule_value, 10);
-    const anchor = task.next_run ? new Date(task.next_run).getTime() : Date.now();
+    const anchor = task.next_run
+      ? new Date(task.next_run).getTime()
+      : Date.now();
     let nextTime = anchor + ms;
     while (nextTime <= Date.now()) {
       nextTime += ms;
@@ -67,11 +75,29 @@ function computeNextRun(task: ScheduledTask): string | null {
   return null;
 }
 
+/**
+ * Re-check DB before running — task may have been cancelled/paused while queued.
+ * Returns true if the task is still active and should proceed.
+ */
+function isTaskStillActive(taskId: string, label?: string): boolean {
+  const currentTask = getTaskById(taskId);
+  if (!currentTask || currentTask.status !== 'active') {
+    logger.info(
+      { taskId },
+      `Skipping ${label ?? 'task'}: deleted or no longer active since enqueue`,
+    );
+    return false;
+  }
+  return true;
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
   groupJid: string,
 ): Promise<void> {
+  if (!isTaskStillActive(task.id, 'task')) return;
+
   runningTaskIds.add(task.id);
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
@@ -100,6 +126,39 @@ async function runTask(
     });
     runningTaskIds.delete(task.id);
     return;
+  }
+
+  // Billing quota check before running task
+  if (isBillingEnabled() && group.created_by) {
+    const owner = getUserById(group.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccessFresh(group.created_by, owner.role);
+      if (!accessResult.allowed) {
+        const reason = accessResult.reason || '当前账户不可用';
+        logger.info(
+          {
+            taskId: task.id,
+            userId: group.created_by,
+            reason,
+            blockType: accessResult.blockType,
+          },
+          'Billing access denied, blocking scheduled task',
+        );
+        logTaskRun({
+          task_id: task.id,
+          run_at: new Date().toISOString(),
+          duration_ms: Date.now() - startTime,
+          status: 'error',
+          result: null,
+          error: `计费限制: ${reason}`,
+        });
+        runningTaskIds.delete(task.id);
+        // Still compute next run so the task isn't stuck
+        const nextRun = computeNextRun(task);
+        updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+        return;
+      }
+    }
   }
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -243,6 +302,8 @@ async function runScriptTask(
   deps: SchedulerDependencies,
   groupJid: string,
 ): Promise<void> {
+  if (!isTaskStillActive(task.id, 'script task')) return;
+
   runningTaskIds.add(task.id);
   const startTime = Date.now();
 
@@ -251,11 +312,50 @@ async function runScriptTask(
     'Running script task',
   );
 
+  // Billing quota check before running script task
+  if (isBillingEnabled() && task.group_folder) {
+    const groups = deps.registeredGroups();
+    const group = groups[groupJid];
+    if (group?.created_by) {
+      const owner = getUserById(group.created_by);
+      if (owner && owner.role !== 'admin') {
+        const accessResult = checkBillingAccessFresh(group.created_by, owner.role);
+        if (!accessResult.allowed) {
+          const reason = accessResult.reason || '当前账户不可用';
+          logger.info(
+            {
+              taskId: task.id,
+              userId: group.created_by,
+              reason,
+              blockType: accessResult.blockType,
+            },
+            'Billing access denied, blocking script task',
+          );
+          logTaskRun({
+            task_id: task.id,
+            run_at: new Date().toISOString(),
+            duration_ms: Date.now() - startTime,
+            status: 'error',
+            result: null,
+            error: `计费限制: ${reason}`,
+          });
+          runningTaskIds.delete(task.id);
+          const nextRun = computeNextRun(task);
+          updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+          return;
+        }
+      }
+    }
+  }
+
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
   if (!task.script_command) {
-    logger.error({ taskId: task.id }, 'Script task has no script_command, skipping');
+    logger.error(
+      { taskId: task.id },
+      'Script task has no script_command, skipping',
+    );
     logTaskRun({
       task_id: task.id,
       run_at: new Date().toISOString(),
@@ -272,7 +372,10 @@ async function runScriptTask(
   let error: string | null = null;
 
   try {
-    const scriptResult = await runScript(task.script_command, task.group_folder);
+    const scriptResult = await runScript(
+      task.script_command,
+      task.group_folder,
+    );
 
     if (scriptResult.timedOut) {
       error = `脚本执行超时 (${Math.round(scriptResult.durationMs / 1000)}s)`;
@@ -288,10 +391,14 @@ async function runScriptTask(
       ? `[脚本] 执行失败: ${error}${result ? `\n输出:\n${result.slice(0, 500)}` : ''}`
       : `[脚本] ${result!.slice(0, 1000)}`;
 
-    await deps.sendMessage(groupJid, `${deps.assistantName}: ${text}`);
+    await deps.sendMessage(groupJid, `${deps.assistantName}: ${text}`, { source: 'scheduled_task' });
 
     logger.info(
-      { taskId: task.id, durationMs: Date.now() - startTime, exitCode: scriptResult.exitCode },
+      {
+        taskId: task.id,
+        durationMs: Date.now() - startTime,
+        exitCode: scriptResult.exitCode,
+      },
       'Script task completed',
     );
   } catch (err) {
@@ -382,8 +489,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             ([, group]) => group.folder === currentTask.group_folder,
           );
           const preferred =
-            sameFolder.find(([jid]) => jid.startsWith('web:')) ||
-            sameFolder[0];
+            sameFolder.find(([jid]) => jid.startsWith('web:')) || sameFolder[0];
           targetGroupJid = preferred?.[0] || '';
         }
 
@@ -405,7 +511,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           }
           // Script tasks run directly, not through GroupQueue
           runScriptTask(currentTask, deps, targetGroupJid).catch((err) => {
-            logger.error({ taskId: currentTask.id, err }, 'Unhandled error in runScriptTask');
+            logger.error(
+              { taskId: currentTask.id, err },
+              'Unhandled error in runScriptTask',
+            );
           });
         } else {
           deps.queue.enqueueTask(targetGroupJid, currentTask.id, () =>

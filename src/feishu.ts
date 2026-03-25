@@ -14,13 +14,14 @@ import {
   MAX_FILE_SIZE,
   FileTooLargeError,
 } from './im-downloader.js';
+import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
-import { analyzeIntent } from './intent-analyzer.js';
 import {
   resolveJidByMessageId,
   getStreamingSession,
 } from './feishu-streaming-card.js';
+import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -71,11 +72,8 @@ export interface ConnectOptions {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string) => boolean;
-  /** 中断 fast-path：消息到达时立即检测中断意图，绕过轮询延迟直接触发中断 */
-  onInterruptRequest?: (
-    chatJid: string,
-    intent: 'stop' | 'correction',
-  ) => void;
+  /** 飞书流式卡片按钮中断回调 */
+  onCardInterrupt?: (chatJid: string) => void;
 }
 
 export interface FeishuChatInfo {
@@ -103,6 +101,8 @@ export interface FeishuConnection {
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
+  /** Clear the "OnIt" ack reaction for a chat (e.g. when streaming card handled the reply). */
+  clearAckReaction(chatId: string): void;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
   getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
@@ -116,6 +116,8 @@ export interface FeishuConnection {
 
 // Max characters per markdown element in Feishu cards
 const CARD_MD_LIMIT = 4000;
+// Feishu card allows at most 5 markdown tables; beyond this, skip card and use post+md directly
+const CARD_TABLE_LIMIT = 5;
 const FEISHU_WS_READY_STATE_OPEN = 1;
 const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
 const WS_RECONNECT_CHECK_THRESHOLD = 4;
@@ -162,6 +164,41 @@ function extractMessageContent(
   messageType: string,
   content: string,
 ): { text: string; imageKeys?: string[]; fileInfos?: FeishuFileInfo[] } {
+  // merge_forward: WebSocket 推送的内容是纯字符串 "Merged and Forwarded Message"（非 JSON），
+  // 必须在 JSON.parse 之前单独处理，否则 parse 失败导致消息被丢弃
+  if (messageType === 'merge_forward') {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { text: '[合并转发消息]' };
+    }
+    const items = parsed.message_list || parsed.items || [];
+    if (!Array.isArray(items) || items.length === 0) {
+      return { text: '[合并转发消息]' };
+    }
+    const lines: string[] = ['[合并转发消息]:'];
+    for (const item of items.slice(0, 20)) {
+      const sender = item.sender_name || item.sender || '未知';
+      const body = item.body?.content || item.content || '';
+      let text = '';
+      try {
+        const subType = item.msg_type || item.message_type || 'text';
+        const sub = extractMessageContent(subType, body);
+        text = sub.text || '';
+      } catch {
+        text = typeof body === 'string' ? body : '';
+      }
+      if (text) {
+        lines.push(`> ${sender}: ${text.split('\n')[0].slice(0, 200)}`);
+      }
+    }
+    if (items.length > 20) {
+      lines.push(`> ... 共 ${items.length} 条消息`);
+    }
+    return { text: lines.join('\n') };
+  }
+
   try {
     const parsed = JSON.parse(content);
 
@@ -301,34 +338,6 @@ function extractMessageContent(
       return { text: `[分享用户: ${userName}]` };
     }
 
-    if (messageType === 'merge_forward') {
-      // 合并转发消息：递归提取子消息内容，格式化为引用块
-      const items = parsed.message_list || parsed.items || [];
-      if (!Array.isArray(items) || items.length === 0) {
-        return { text: '[合并转发消息]' };
-      }
-      const lines: string[] = ['[合并转发消息]:'];
-      for (const item of items.slice(0, 20)) {
-        const sender = item.sender_name || item.sender || '未知';
-        const body = item.body?.content || item.content || '';
-        let text = '';
-        try {
-          const subType = item.msg_type || item.message_type || 'text';
-          const sub = extractMessageContent(subType, body);
-          text = sub.text || '';
-        } catch {
-          text = typeof body === 'string' ? body : '';
-        }
-        if (text) {
-          lines.push(`> ${sender}: ${text.split('\n')[0].slice(0, 200)}`);
-        }
-      }
-      if (items.length > 20) {
-        lines.push(`> ... 共 ${items.length} 条消息`);
-      }
-      return { text: lines.join('\n') };
-    }
-
     if (messageType === 'system') {
       const body = parsed.body || parsed.content || '';
       const systemText =
@@ -336,14 +345,80 @@ function extractMessageContent(
       return { text: `[系统消息: ${systemText.slice(0, 200)}]` };
     }
 
-    // Ignore other unknown message types
-    return { text: '' };
+    if (messageType === 'interactive') {
+      // Extract title and text elements from interactive card messages
+      const parts: string[] = [];
+      if (parsed.title) {
+        parts.push(parsed.title);
+      }
+      if (Array.isArray(parsed.elements)) {
+        for (const row of parsed.elements) {
+          if (!Array.isArray(row)) continue;
+          for (const el of row) {
+            if (!el || typeof el !== 'object') continue;
+            if (el.tag === 'text' && typeof el.text === 'string') {
+              parts.push(el.text);
+            } else if (el.tag === 'a' && typeof el.text === 'string') {
+              parts.push(`[${el.text}](${el.href || ''})`);
+            } else if (
+              el.tag === 'note' &&
+              Array.isArray(el.elements)
+            ) {
+              const noteText = el.elements
+                .filter(
+                  (n: any) =>
+                    n.tag === 'text' && typeof n.text === 'string',
+                )
+                .map((n: any) => n.text)
+                .join('');
+              if (noteText) parts.push(noteText);
+            }
+            // Skip buttons, hr, select_static, img — not useful as text
+          }
+        }
+      }
+      const cardText = parts.filter(Boolean).join('\n');
+      return { text: cardText || '[飞书卡片消息]' };
+    }
+
+    if (messageType === 'media') {
+      return { text: '[视频消息]' };
+    }
+
+    if (messageType === 'location') {
+      return {
+        text: `[位置: ${parsed.name || parsed.address || '未知位置'}]`,
+      };
+    }
+
+    if (messageType === 'share_calendar_event') {
+      return {
+        text: `[日程分享: ${parsed.summary || parsed.event_id || ''}]`,
+      };
+    }
+
+    if (messageType === 'video_chat') {
+      return { text: `[视频会议: ${parsed.topic || ''}]` };
+    }
+
+    if (messageType === 'todo') {
+      return {
+        text: `[待办: ${parsed.task_id || parsed.summary || ''}]`,
+      };
+    }
+
+    if (messageType === 'hongbao') {
+      return { text: '[红包消息]' };
+    }
+
+    // 未知消息类型：返回类型占位符，避免静默丢弃
+    return { text: `[${messageType}]` };
   } catch (err) {
     logger.warn(
       { err, messageType, content },
       'Failed to parse message content',
     );
-    return { text: '' };
+    return { text: `[${messageType}]` };
   }
 }
 
@@ -399,15 +474,28 @@ function getFileType(
 }
 
 /**
- * Build a Feishu interactive card from markdown text.
- * Extracts headings as card title, splits content into visual sections.
+ * Build a Feishu interactive card (Schema 2.0) from markdown text.
+ * Applies optimizeMarkdownStyle() for proper rendering in Feishu cards:
+ * - Heading demotion (H1→H4, H2~H6→H5)
+ * - Code block / table spacing with <br>
+ * - Invalid image cleanup
  */
+/** Build a post+md fallback content string for when interactive card send fails. */
+function buildPostMdFallback(text: string): string {
+  return JSON.stringify({
+    zh_cn: {
+      content: [[{ tag: 'md', text: optimizeMarkdownStyle(text, 1) }]],
+    },
+  });
+}
+
 function buildInteractiveCard(text: string): object {
+  const optimized = optimizeMarkdownStyle(text, 2);
   const lines = text.split('\n');
   let title = '';
   let bodyStartIdx = 0;
 
-  // Extract title from first heading if present
+  // Extract title from first heading if present (use original text for title)
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     if (/^#{1,3}\s+/.test(lines[i])) {
@@ -417,7 +505,22 @@ function buildInteractiveCard(text: string): object {
     break;
   }
 
-  const body = lines.slice(bodyStartIdx).join('\n').trim();
+  // Apply optimizeMarkdownStyle to body (title was already extracted from original)
+  const optimizedLines = optimized.split('\n');
+  // Skip lines corresponding to the title in optimized text
+  let optimizedBody: string;
+  if (bodyStartIdx > 0) {
+    // Find the first non-empty line in optimized text and skip it (it's the demoted title)
+    let skipIdx = 0;
+    for (let i = 0; i < optimizedLines.length; i++) {
+      if (!optimizedLines[i].trim()) continue;
+      skipIdx = i + 1;
+      break;
+    }
+    optimizedBody = optimizedLines.slice(skipIdx).join('\n').trim();
+  } else {
+    optimizedBody = optimized.trim();
+  }
 
   // Generate title if no heading found — use first line preview
   if (!title) {
@@ -432,7 +535,7 @@ function buildInteractiveCard(text: string): object {
 
   // Build card elements
   const elements: Array<Record<string, unknown>> = [];
-  const contentToRender = body || text.trim();
+  const contentToRender = optimizedBody || optimized.trim();
 
   if (contentToRender.length > CARD_MD_LIMIT) {
     // Long content: split into multiple markdown elements
@@ -452,16 +555,20 @@ function buildInteractiveCard(text: string): object {
 
   // Ensure at least one element
   if (elements.length === 0) {
-    elements.push({ tag: 'markdown', content: text.trim() });
+    elements.push({ tag: 'markdown', content: optimized.trim() });
   }
 
   return {
-    config: { wide_screen_mode: true },
+    schema: '2.0',
+    config: {
+      wide_screen_mode: true,
+      summary: { content: title },
+    },
     header: {
       title: { tag: 'plain_text', content: title },
       template: 'indigo',
     },
-    elements,
+    body: { elements },
   };
 }
 
@@ -557,9 +664,12 @@ export function createFeishuConnection(
 
   function isDuplicate(msgId: string): boolean {
     const now = Date.now();
+    // Map preserves insertion order; stop at first non-expired entry
     for (const [id, ts] of msgCache.entries()) {
       if (now - ts > MSG_DEDUP_TTL) {
         msgCache.delete(id);
+      } else {
+        break;
       }
     }
     if (msgCache.size >= MSG_DEDUP_MAX) {
@@ -751,7 +861,6 @@ export function createFeishuConnection(
       onAgentMessage,
       resolveRouteHint,
       shouldProcessGroupMessage,
-      onInterruptRequest,
     } = connectOptions || {};
     const {
       chatId,
@@ -1029,18 +1138,6 @@ export function createFeishuConnection(
     const agentRouting = resolveEffectiveChatJid?.(chatJid);
     const targetJid = agentRouting?.effectiveJid ?? chatJid;
 
-    // ── 中断 fast-path：消息到达时立即检测中断意图，绕过 2s 轮询延迟 ──
-    // 使用路由后的 targetJid 确保中断命中正确的 queue key
-    if (onInterruptRequest && text.length <= 50) {
-      const intent = analyzeIntent(text);
-      if (intent !== 'continue') {
-        onInterruptRequest(targetJid, intent);
-        logger.info(
-          { chatJid, targetJid, messageId, intent },
-          'Interrupt fast-path triggered from Feishu',
-        );
-      }
-    }
     const targetAgentId = agentRouting?.agentId;
 
     storeChatMetadata(targetJid, timestamp);
@@ -1052,9 +1149,7 @@ export function createFeishuConnection(
       text,
       timestamp,
       false,
-      attachmentsJson,
-      undefined,
-      chatJid,
+      { attachments: attachmentsJson, sourceJid: chatJid },
     );
     broadcastNewMessage(
       targetJid,
@@ -1070,6 +1165,7 @@ export function createFeishuConnection(
       },
       targetAgentId ?? undefined,
     );
+    notifyNewImMessage();
 
     if (agentRouting && agentRouting.agentId) {
       onAgentMessage?.(chatJid, agentRouting.agentId);
@@ -1438,7 +1534,7 @@ export function createFeishuConnection(
             }
 
             logger.info({ chatJid, messageId }, 'Card action: interrupt via button');
-            connectOptions?.onInterruptRequest?.(chatJid, 'stop');
+            connectOptions?.onCardInterrupt?.(chatJid);
           } catch (err) {
             logger.error({ err }, 'Error handling card action trigger');
           }
@@ -1519,52 +1615,78 @@ export function createFeishuConnection(
       };
 
       try {
-        const card = buildInteractiveCard(text);
-        const content = JSON.stringify(card);
+        // Count markdown tables to decide format upfront — Feishu cards have a table limit
+        // Each table has exactly one separator row (e.g. |---|---|), so counting those = table count
+        const tableCount = (text.match(/^\|[\s:-]+\|/gm) || []).length;
+        const usePostMd = tableCount > CARD_TABLE_LIMIT;
 
-        const lastMsgId = lastMessageIdByChat.get(chatId);
-        if (lastMsgId) {
-          try {
+        if (usePostMd) {
+          // Too many tables for card format, go directly to post+md
+          const postContent = buildPostMdFallback(text);
+          const lastMsgId = lastMessageIdByChat.get(chatId);
+          if (lastMsgId) {
             await client.im.message.reply({
               path: { message_id: lastMsgId },
-              data: { content, msg_type: 'interactive' },
+              data: { content: postContent, msg_type: 'post' },
             });
-          } catch (err) {
-            logger.warn(
-              { err, chatId },
-              'Feishu interactive reply failed, fallback to plain text',
-            );
-            await client.im.message.reply({
-              path: { message_id: lastMsgId },
+          } else {
+            await client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
               data: {
-                content: JSON.stringify({ text }),
-                msg_type: 'text',
+                receive_id: chatId,
+                msg_type: 'post',
+                content: postContent,
               },
             });
           }
         } else {
-          try {
-            await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chatId,
-                msg_type: 'interactive',
-                content,
-              },
-            });
-          } catch (err) {
-            logger.warn(
-              { err, chatId },
-              'Feishu interactive create failed, fallback to plain text',
-            );
-            await client.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: {
-                receive_id: chatId,
-                msg_type: 'text',
-                content: JSON.stringify({ text }),
-              },
-            });
+          const card = buildInteractiveCard(text);
+          const content = JSON.stringify(card);
+
+          const lastMsgId = lastMessageIdByChat.get(chatId);
+          if (lastMsgId) {
+            try {
+              await client.im.message.reply({
+                path: { message_id: lastMsgId },
+                data: { content, msg_type: 'interactive' },
+              });
+            } catch (err) {
+              logger.warn(
+                { err, chatId },
+                'Feishu interactive reply failed, fallback to post+md',
+              );
+              await client.im.message.reply({
+                path: { message_id: lastMsgId },
+                data: {
+                  content: buildPostMdFallback(text),
+                  msg_type: 'post',
+                },
+              });
+            }
+          } else {
+            try {
+              await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: {
+                  receive_id: chatId,
+                  msg_type: 'interactive',
+                  content,
+                },
+              });
+            } catch (err) {
+              logger.warn(
+                { err, chatId },
+                'Feishu interactive create failed, fallback to post+md',
+              );
+              await client.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: {
+                  receive_id: chatId,
+                  msg_type: 'post',
+                  content: buildPostMdFallback(text),
+                },
+              });
+            }
           }
         }
         logger.debug({ chatId }, 'Sent Feishu card message');
@@ -1577,8 +1699,12 @@ export function createFeishuConnection(
                 image_type: 'message',
                 image: fs.createReadStream(localImagePath),
               },
-            })) as { data?: { image_key?: string } } | null;
-            const imageKey = uploadRes?.data?.image_key;
+            })) as
+              | { image_key?: string; data?: { image_key?: string } }
+              | null
+              | undefined;
+            const imageKey =
+              uploadRes?.image_key ?? uploadRes?.data?.image_key;
             if (!imageKey) {
               logger.warn(
                 { chatId, localImagePath },
@@ -1629,9 +1755,13 @@ export function createFeishuConnection(
             image_type: 'message',
             image: imageBuffer,
           },
-        })) as { data?: { image_key?: string } } | null;
+        })) as
+          | { image_key?: string; data?: { image_key?: string } }
+          | null
+          | undefined;
 
-        const imageKey = uploadResult?.data?.image_key;
+        const imageKey =
+          uploadResult?.image_key ?? uploadResult?.data?.image_key;
         if (!imageKey) {
           logger.error(
             { chatId },
@@ -1722,9 +1852,13 @@ export function createFeishuConnection(
             file_name: fileName,
             file: buffer,
           },
-        })) as { data?: { file_key?: string } } | null;
+        })) as
+          | { file_key?: string; data?: { file_key?: string } }
+          | null
+          | undefined;
 
-        const fileKey = uploadResult?.data?.file_key;
+        const fileKey =
+          uploadResult?.file_key ?? uploadResult?.data?.file_key;
         if (!fileKey) {
           throw new Error('文件上传失败：未返回 file_key');
         }
@@ -1772,6 +1906,15 @@ export function createFeishuConnection(
           await removeReaction(msgId, reactionId);
           typingReactionByChat.delete(chatId);
         }
+      }
+    },
+
+    clearAckReaction(chatId: string): void {
+      const ackStored = ackReactionByChat.get(chatId);
+      if (ackStored) {
+        const [ackMsgId, ackReactionId] = ackStored.split(':');
+        removeReaction(ackMsgId, ackReactionId).catch(() => {});
+        ackReactionByChat.delete(chatId);
       }
     },
 

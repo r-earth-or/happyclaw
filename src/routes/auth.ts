@@ -36,8 +36,8 @@ import {
 } from '../db.js';
 import {
   getRegistrationConfig,
-  getClaudeProviderConfig,
   getFeishuProviderConfig,
+  getEnabledProviders,
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
 } from '../runtime-config.js';
@@ -55,22 +55,50 @@ import {
 } from '../auth.js';
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
-import { lastActiveCache } from '../web-context.js';
-import { SESSION_COOKIE_NAME } from '../config.js';
+import { invalidateSessionCache, invalidateUserSessions } from '../web-context.js';
+import {
+  SESSION_COOKIE_NAME_SECURE,
+  SESSION_COOKIE_NAME_PLAIN,
+  TRUST_PROXY,
+} from '../config.js';
 import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
 
 // --- Helper Functions ---
 
-export function setSessionCookie(token: string): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 60 * 60}${secure}`;
+/** Detect if the current request arrived over HTTPS (direct or behind proxy) */
+function isSecureRequest(c: any): boolean {
+  if (TRUST_PROXY) {
+    const proto = c.req.header('x-forwarded-proto');
+    if (proto === 'https') return true;
+  }
+  // Hono / node-server: URL scheme
+  try {
+    const url = new URL(c.req.url, 'http://localhost');
+    if (url.protocol === 'https:') return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
 }
 
-export function clearSessionCookie(): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`;
+function getSessionCookieName(secure: boolean): string {
+  return secure ? SESSION_COOKIE_NAME_SECURE : SESSION_COOKIE_NAME_PLAIN;
+}
+
+export function setSessionCookie(c: any, token: string): string {
+  const secure = isSecureRequest(c);
+  const name = getSessionCookieName(secure);
+  const secureSuffix = secure ? '; Secure' : '';
+  return `${name}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 60 * 60}${secureSuffix}`;
+}
+
+export function clearSessionCookie(c: any): string {
+  const secure = isSecureRequest(c);
+  const name = getSessionCookieName(secure);
+  const secureSuffix = secure ? '; Secure' : '';
+  return `${name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix}`;
 }
 
 export function isUsernameConflictError(err: unknown): boolean {
@@ -95,6 +123,7 @@ export function toUserPublic(u: User): UserPublic {
     notes: u.notes,
     avatar_emoji: u.avatar_emoji ?? null,
     avatar_color: u.avatar_color ?? null,
+    avatar_url: u.avatar_url ?? null,
     ai_name: u.ai_name ?? null,
     ai_avatar_emoji: u.ai_avatar_emoji ?? null,
     ai_avatar_color: u.ai_avatar_color ?? null,
@@ -107,15 +136,21 @@ export function toUserPublic(u: User): UserPublic {
 }
 
 function buildSetupStatus() {
-  const claudeConfig = getClaudeProviderConfig();
-  const officialConfigured =
-    !!claudeConfig.claudeCodeOauthToken?.trim() ||
-    !!claudeConfig.claudeOAuthCredentials;
-  const thirdPartyConfigured = !!(
-    claudeConfig.anthropicBaseUrl?.trim() &&
-    claudeConfig.anthropicAuthToken?.trim()
-  );
-  const claudeConfigured = officialConfigured || thirdPartyConfigured;
+  // Check ALL enabled providers, not just the first one.
+  // V3→V4 migration can produce empty providers that sort before real ones,
+  // causing the first configured provider lookup to return an unconfigured provider.
+  const providers = getEnabledProviders();
+  const claudeConfigured = providers.some((p) => {
+    const hasOfficial =
+      !!p.claudeCodeOauthToken?.trim() ||
+      !!p.claudeOAuthCredentials ||
+      !!p.anthropicApiKey?.trim();
+    const hasThirdParty = !!(
+      p.anthropicBaseUrl?.trim() &&
+      p.anthropicAuthToken?.trim()
+    );
+    return hasOfficial || hasThirdParty;
+  });
   const { source: feishuSource } = getFeishuProviderConfigWithSource();
   const feishuConfigured = feishuSource !== 'none';
 
@@ -271,7 +306,7 @@ authRoutes.post('/setup', async (c) => {
       status: 201,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(token),
+        'Set-Cookie': setSessionCookie(c, token),
       },
     },
   );
@@ -346,9 +381,9 @@ authRoutes.get('/feishu/callback', async (c) => {
   }
   feishuOauthFlows.delete(state);
 
-    const config = getFeishuProviderConfig();
-    if (!config.appId || !config.appSecret) {
-      return redirectToLoginWithError(c, '飞书登录未配置');
+  const config = getFeishuProviderConfig();
+  if (!config.appId || !config.appSecret) {
+    return redirectToLoginWithError(c, '飞书登录未配置');
   }
 
   try {
@@ -486,7 +521,7 @@ authRoutes.get('/feishu/callback', async (c) => {
       status: 302,
       headers: {
         Location: getAppUrl(c.req.url, nextPath),
-        'Set-Cookie': setSessionCookie(token),
+        'Set-Cookie': setSessionCookie(c, token),
       },
     });
   } catch (err) {
@@ -616,7 +651,7 @@ authRoutes.post('/login', async (c) => {
       status: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(token),
+        'Set-Cookie': setSessionCookie(c, token),
       },
     },
   );
@@ -777,7 +812,7 @@ authRoutes.post('/register', async (c) => {
       status: 201,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(token),
+        'Set-Cookie': setSessionCookie(c, token),
       },
     },
   );
@@ -786,7 +821,7 @@ authRoutes.post('/register', async (c) => {
 authRoutes.post('/logout', authMiddleware, (c) => {
   const sessionId = c.get('sessionId');
   deleteUserSession(sessionId);
-  lastActiveCache.delete(sessionId);
+  invalidateSessionCache(sessionId);
   const user = c.get('user') as AuthUser;
   logAuthEvent({
     event_type: 'logout',
@@ -798,7 +833,7 @@ authRoutes.post('/logout', authMiddleware, (c) => {
     status: 200,
     headers: {
       'Content-Type': 'application/json',
-      'Set-Cookie': clearSessionCookie(),
+      'Set-Cookie': clearSessionCookie(c),
     },
   });
 });
@@ -857,6 +892,9 @@ authRoutes.put('/profile', authMiddleware, async (c) => {
   }
   if (validation.data.avatar_color !== undefined) {
     updates.avatar_color = validation.data.avatar_color;
+  }
+  if (validation.data.avatar_url !== undefined) {
+    updates.avatar_url = validation.data.avatar_url;
   }
   if (validation.data.ai_name !== undefined) {
     updates.ai_name = validation.data.ai_name;
@@ -938,6 +976,7 @@ authRoutes.put('/password', authMiddleware, async (c) => {
   });
 
   // Revoke all existing sessions for this user
+  invalidateUserSessions(user.id);
   deleteUserSessionsByUserId(user.id);
 
   // Create a fresh session for the current request
@@ -969,7 +1008,7 @@ authRoutes.put('/password', authMiddleware, async (c) => {
       status: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': setSessionCookie(newToken),
+        'Set-Cookie': setSessionCookie(c, newToken),
       },
     },
   );
@@ -1002,7 +1041,7 @@ authRoutes.delete('/sessions/:id', authMiddleware, (c) => {
   if (!target) return c.json({ error: 'Session not found' }, 404);
 
   deleteUserSession(target.id);
-  lastActiveCache.delete(target.id);
+  invalidateSessionCache(target.id);
   logAuthEvent({
     event_type: 'session_revoked',
     username: user.username,
@@ -1020,7 +1059,7 @@ const ALLOWED_AVATAR_TYPES: Record<string, string> = {
   'image/gif': '.gif',
   'image/webp': '.webp',
 };
-const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
+const MAX_AVATAR_SIZE = 3 * 1024 * 1024; // 3MB
 
 authRoutes.post('/avatar', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
@@ -1037,7 +1076,7 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
   }
 
   if (file.size > MAX_AVATAR_SIZE) {
-    return c.json({ error: 'File too large (max 2MB)' }, 400);
+    return c.json({ error: 'File too large (max 3MB)' }, 400);
   }
 
   const ext = ALLOWED_AVATAR_TYPES[file.type];
@@ -1071,8 +1110,10 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   const avatarUrl = `/api/auth/avatars/${filename}`;
 
-  // Update user profile with new avatar URL
-  updateUserFields(user.id, { ai_avatar_url: avatarUrl });
+  // Update user profile — target=user stores as avatar_url, otherwise ai_avatar_url
+  const target = c.req.query('target');
+  const field = target === 'user' ? 'avatar_url' : 'ai_avatar_url';
+  updateUserFields(user.id, { [field]: avatarUrl });
 
   const updated = getUserById(user.id)!;
   return c.json({ success: true, avatarUrl, user: toUserPublic(updated) });

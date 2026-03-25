@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import Database from './sqlite-compat.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -23,9 +23,11 @@ import {
   GroupMember,
   InviteCode,
   InviteCodeWithCreator,
+  MessageFinalizationReason,
   MonthlyUsage,
   NewMessage,
   MessageCursor,
+  MessageSourceKind,
   RedeemCode,
   RegisteredGroup,
   ScheduledTask,
@@ -44,7 +46,121 @@ import {
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
-let db: Database.Database;
+let db: InstanceType<typeof Database>;
+
+// Prepared statement cache — lazy-initialized on first use after initDatabase()
+let _stmts: {
+  storeMessageSelect: any;
+  storeMessageInsert: any;
+  insertUsageInsert: any;
+  insertUsageUpsert: any;
+  getSessionWithUser: any;
+  deleteSession: any;
+  updateSessionLastActive: any;
+  updateTokenUsageById: any;
+  updateTokenUsageLatest: any;
+  getMessagesSince: any;
+  getExpiredSessionIds: any;
+} | null = null;
+
+const _newMsgStmtCache = new Map<number, any>();
+
+function stmts() {
+  if (!_stmts) {
+    _stmts = {
+      storeMessageSelect: db.prepare(
+        `SELECT id FROM messages
+         WHERE chat_jid = ? AND turn_id = ? AND source_kind = 'sdk_final'
+         ORDER BY timestamp DESC LIMIT 1`,
+      ),
+      storeMessageInsert: db.prepare(
+        `INSERT OR REPLACE INTO messages (
+          id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      insertUsageInsert: db.prepare(
+        `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
+          input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+          cost_usd, duration_ms, num_turns, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      insertUsageUpsert: db.prepare(
+        `INSERT INTO usage_daily_summary (user_id, model, date,
+          total_input_tokens, total_output_tokens,
+          total_cache_read_tokens, total_cache_creation_tokens,
+          total_cost_usd, request_count, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(user_id, model, date) DO UPDATE SET
+          total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+          total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+          total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+          total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
+          total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+          request_count = request_count + 1,
+          updated_at = datetime('now')`,
+      ),
+      getSessionWithUser: db.prepare(
+        `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password
+         FROM user_sessions s
+         JOIN users u ON s.user_id = u.id
+         WHERE s.id = ?`,
+      ),
+      deleteSession: db.prepare('DELETE FROM user_sessions WHERE id = ?'),
+      updateSessionLastActive: db.prepare(
+        'UPDATE user_sessions SET last_active_at = ? WHERE id = ?',
+      ),
+      updateTokenUsageById: db.prepare(
+        `UPDATE messages SET token_usage = ?, cost_usd = ? WHERE id = ? AND chat_jid = ?`,
+      ),
+      updateTokenUsageLatest: db.prepare(
+        `UPDATE messages SET token_usage = ?, cost_usd = ?
+         WHERE rowid = (
+           SELECT rowid FROM messages
+           WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
+             AND COALESCE(source_kind, 'legacy') != 'sdk_send_message'
+           ORDER BY timestamp DESC LIMIT 1
+         )`,
+      ),
+      getMessagesSince: db.prepare(
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+         FROM messages
+         WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
+         ORDER BY timestamp ASC, id ASC`,
+      ),
+      getExpiredSessionIds: db.prepare(
+        'SELECT id FROM user_sessions WHERE expires_at < ?',
+      ),
+    };
+  }
+  return _stmts;
+}
+
+function getNewMessagesStmt(jidCount: number): any {
+  let s = _newMsgStmtCache.get(jidCount);
+  if (!s) {
+    const placeholders = Array(jidCount).fill('?').join(',');
+    s = db.prepare(
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+       FROM messages
+       WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
+         AND chat_jid IN (${placeholders})
+         AND is_from_me = 0
+         AND COALESCE(source_kind, '') != 'user_command'
+       ORDER BY timestamp ASC, id ASC`,
+    );
+    _newMsgStmtCache.set(jidCount, s);
+  }
+  return s;
+}
+
+interface StoredMessageMeta {
+  turnId?: string | null;
+  sessionId?: string | null;
+  sdkMessageUuid?: string | null;
+  sourceKind?: MessageSourceKind | null;
+  finalizationReason?: MessageFinalizationReason | null;
+}
 
 function hasColumn(tableName: string, columnName: string): boolean {
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{
@@ -104,8 +220,8 @@ export function initDatabase(): void {
   db = new Database(dbPath);
 
   // Enable WAL mode for better concurrency and performance
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 5000');
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -123,6 +239,11 @@ export function initDatabase(): void {
       is_from_me INTEGER,
       attachments TEXT,
       token_usage TEXT,
+      turn_id TEXT,
+      session_id TEXT,
+      sdk_message_uuid TEXT,
+      source_kind TEXT,
+      finalization_reason TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -144,7 +265,8 @@ export function initDatabase(): void {
       last_result TEXT,
       status TEXT DEFAULT 'active',
       created_at TEXT NOT NULL,
-      created_by TEXT
+      created_by TEXT,
+      notify_channels TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -288,7 +410,9 @@ export function initDatabase(): void {
       created_by TEXT,
       created_at TEXT NOT NULL,
       completed_at TEXT,
-      result_summary TEXT
+      result_summary TEXT,
+      last_im_jid TEXT,
+      spawned_from_jid TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
@@ -507,6 +631,7 @@ export function initDatabase(): void {
   ensureColumn('messages', 'source_jid', 'TEXT');
   ensureColumn('registered_groups', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'is_home', 'INTEGER DEFAULT 0');
+  ensureColumn('users', 'avatar_url', 'TEXT');
   ensureColumn('users', 'ai_name', 'TEXT');
   ensureColumn('users', 'ai_avatar_emoji', 'TEXT');
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
@@ -514,6 +639,7 @@ export function initDatabase(): void {
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
+  ensureColumn('scheduled_tasks', 'notify_channels', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
   ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
@@ -529,6 +655,11 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'selected_mcps', 'TEXT');
   ensureColumn('registered_groups', 'activation_mode', "TEXT DEFAULT 'auto'");
   ensureColumn('messages', 'token_usage', 'TEXT');
+  ensureColumn('messages', 'turn_id', 'TEXT');
+  ensureColumn('messages', 'session_id', 'TEXT');
+  ensureColumn('messages', 'sdk_message_uuid', 'TEXT');
+  ensureColumn('messages', 'source_kind', 'TEXT');
+  ensureColumn('messages', 'finalization_reason', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec(
@@ -643,6 +774,7 @@ export function initDatabase(): void {
     'notes',
     'avatar_emoji',
     'avatar_color',
+    'avatar_url',
     'ai_name',
     'ai_avatar_emoji',
     'ai_avatar_color',
@@ -1040,7 +1172,27 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '28';
+  // v29 → v30: Add last_im_jid to agents table (#225)
+  if (
+    !db
+      .prepare("PRAGMA table_info('agents')")
+      .all()
+      .some((c: any) => c.name === 'last_im_jid')
+  ) {
+    db.exec('ALTER TABLE agents ADD COLUMN last_im_jid TEXT');
+  }
+
+  // v31 → v32: Add spawned_from_jid to agents table (spawn parallel tasks)
+  if (
+    !db
+      .prepare("PRAGMA table_info('agents')")
+      .all()
+      .some((c: any) => c.name === 'spawned_from_jid')
+  ) {
+    db.exec('ALTER TABLE agents ADD COLUMN spawned_from_jid TEXT');
+  }
+
+  const SCHEMA_VERSION = '32';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1154,14 +1306,21 @@ export function storeMessageDirect(
   content: string,
   timestamp: string,
   isFromMe: boolean,
-  attachments?: string,
-  tokenUsage?: string,
-  sourceJid?: string,
-): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msgId,
+  opts?: {
+    attachments?: string;
+    tokenUsage?: string;
+    sourceJid?: string;
+    meta?: StoredMessageMeta;
+  },
+): string {
+  const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
+  const existingFinalRow =
+    meta?.sourceKind === 'sdk_final' && meta.turnId
+      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as { id: string } | undefined)
+      : undefined;
+  const effectiveMsgId = existingFinalRow?.id || msgId;
+  stmts().storeMessageInsert.run(
+    effectiveMsgId,
     chatJid,
     sourceJid ?? chatJid,
     sender,
@@ -1171,7 +1330,13 @@ export function storeMessageDirect(
     isFromMe ? 1 : 0,
     attachments ?? null,
     tokenUsage ?? null,
+    meta?.turnId ?? null,
+    meta?.sessionId ?? null,
+    meta?.sdkMessageUuid ?? null,
+    meta?.sourceKind ?? null,
+    meta?.finalizationReason ?? null,
   );
+  return effectiveMsgId;
 }
 
 /**
@@ -1187,18 +1352,9 @@ export function updateLatestMessageTokenUsage(
   costUsd?: number,
 ): void {
   if (msgId) {
-    db.prepare(
-      `UPDATE messages SET token_usage = ?, cost_usd = ? WHERE id = ? AND chat_jid = ?`,
-    ).run(tokenUsage, costUsd ?? null, msgId, chatJid);
+    stmts().updateTokenUsageById.run(tokenUsage, costUsd ?? null, msgId, chatJid);
   } else {
-    db.prepare(
-      `UPDATE messages SET token_usage = ?, cost_usd = ?
-       WHERE rowid = (
-         SELECT rowid FROM messages
-         WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
-         ORDER BY timestamp DESC LIMIT 1
-       )`,
-    ).run(tokenUsage, costUsd ?? null, chatJid);
+    stmts().updateTokenUsageLatest.run(tokenUsage, costUsd ?? null, chatJid);
   }
 }
 
@@ -1445,15 +1601,7 @@ export function insertUsageRecord(record: {
   const localDate = toLocalDateString();
 
   db.transaction(() => {
-    // Insert into usage_records
-    db.prepare(
-      `
-      INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
-        input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-        cost_usd, duration_ms, num_turns, source, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    ).run(
+    stmts().insertUsageInsert.run(
       id,
       record.userId,
       record.groupFolder,
@@ -1470,25 +1618,7 @@ export function insertUsageRecord(record: {
       record.source ?? 'agent',
       now,
     );
-
-    // Upsert daily summary
-    db.prepare(
-      `
-      INSERT INTO usage_daily_summary (user_id, model, date,
-        total_input_tokens, total_output_tokens,
-        total_cache_read_tokens, total_cache_creation_tokens,
-        total_cost_usd, request_count, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
-      ON CONFLICT(user_id, model, date) DO UPDATE SET
-        total_input_tokens = total_input_tokens + excluded.total_input_tokens,
-        total_output_tokens = total_output_tokens + excluded.total_output_tokens,
-        total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
-        total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
-        total_cost_usd = total_cost_usd + excluded.total_cost_usd,
-        request_count = request_count + 1,
-        updated_at = datetime('now')
-    `,
-    ).run(
+    stmts().insertUsageUpsert.run(
       record.userId,
       record.model,
       localDate,
@@ -1660,26 +1790,12 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
-  const placeholders = jids.map(() => '?').join(',');
-  // Filter out assistant outputs.
-  const sql = `
-    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
-    FROM messages
-    WHERE
-      (timestamp > ? OR (timestamp = ? AND id > ?))
-      AND chat_jid IN (${placeholders})
-      AND is_from_me = 0
-    ORDER BY timestamp ASC, id ASC
-  `;
-
-  const rows = db
-    .prepare(sql)
-    .all(
-      cursor.timestamp,
-      cursor.timestamp,
-      cursor.id,
-      ...jids,
-    ) as NewMessage[];
+  const rows = getNewMessagesStmt(jids.length).all(
+    cursor.timestamp,
+    cursor.timestamp,
+    cursor.id,
+    ...jids,
+  ) as NewMessage[];
   const last = rows[rows.length - 1];
   return {
     messages: rows,
@@ -1691,24 +1807,12 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
-  // Filter out assistant outputs.
-  const sql = `
-    SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
-    FROM messages
-    WHERE
-      chat_jid = ?
-      AND (timestamp > ? OR (timestamp = ? AND id > ?))
-      AND is_from_me = 0
-    ORDER BY timestamp ASC, id ASC
-  `;
-  return db
-    .prepare(sql)
-    .all(
-      chatJid,
-      cursor.timestamp,
-      cursor.timestamp,
-      cursor.id,
-    ) as NewMessage[];
+  return stmts().getMessagesSince.all(
+    chatJid,
+    cursor.timestamp,
+    cursor.timestamp,
+    cursor.id,
+  ) as NewMessage[];
 }
 
 export function createTask(
@@ -1716,8 +1820,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, next_run, status, created_at, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, next_run, status, created_at, created_by, notify_channels)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -1733,13 +1837,28 @@ export function createTask(
     task.status,
     task.created_at,
     task.created_by ?? null,
+    task.notify_channels != null ? JSON.stringify(task.notify_channels) : null,
   );
 }
 
+/** Parse notify_channels from JSON string stored in DB */
+function mapTaskRow(row: unknown): ScheduledTask {
+  const r = row as any;
+  if (typeof r.notify_channels === 'string') {
+    try {
+      r.notify_channels = JSON.parse(r.notify_channels);
+    } catch {
+      r.notify_channels = null;
+    }
+  } else if (r.notify_channels === undefined) {
+    r.notify_channels = null;
+  }
+  return r as ScheduledTask;
+}
+
 export function getTaskById(id: string): ScheduledTask | undefined {
-  return db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as
-    | ScheduledTask
-    | undefined;
+  const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id);
+  return row ? mapTaskRow(row) : undefined;
 }
 
 export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
@@ -1747,13 +1866,15 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
     .prepare(
       'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
     )
-    .all(groupFolder) as ScheduledTask[];
+    .all(groupFolder)
+    .map(mapTaskRow);
 }
 
 export function getAllTasks(): ScheduledTask[] {
   return db
     .prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC')
-    .all() as ScheduledTask[];
+    .all()
+    .map(mapTaskRow);
 }
 
 export function updateTask(
@@ -1769,6 +1890,7 @@ export function updateTask(
       | 'script_command'
       | 'next_run'
       | 'status'
+      | 'notify_channels'
     >
   >,
 ): void {
@@ -1806,6 +1928,10 @@ export function updateTask(
   if (updates.status !== undefined) {
     fields.push('status = ?');
     values.push(updates.status);
+  }
+  if (updates.notify_channels !== undefined) {
+    fields.push('notify_channels = ?');
+    values.push(updates.notify_channels != null ? JSON.stringify(updates.notify_channels) : null);
   }
 
   if (fields.length === 0) return;
@@ -1849,7 +1975,8 @@ export function getDueTasks(): ScheduledTask[] {
     ORDER BY next_run
   `,
     )
-    .all(now) as ScheduledTask[];
+    .all(now)
+    .map(mapTaskRow);
 }
 
 export function updateTaskAfterRun(
@@ -1926,6 +2053,18 @@ export function setRouterState(key: string, value: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run(key, value);
+}
+
+export function deleteRouterState(key: string): void {
+  db.prepare('DELETE FROM router_state WHERE key = ?').run(key);
+}
+
+export function getRouterStateByPrefix(
+  prefix: string,
+): Array<{ key: string; value: string }> {
+  return db
+    .prepare('SELECT key, value FROM router_state WHERE key LIKE ?')
+    .all(`${prefix}%`) as Array<{ key: string; value: string }>;
 }
 
 // --- Session accessors ---
@@ -2038,16 +2177,11 @@ function parseGroupRow(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
-    selected_skills: row.selected_skills
-      ? JSON.parse(row.selected_skills)
-      : null,
     target_agent_id: row.target_agent_id ?? undefined,
     target_main_jid: row.target_main_jid ?? undefined,
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
-    mcp_mode: row.mcp_mode === 'custom' ? 'custom' : 'inherit',
-    selected_mcps: row.selected_mcps ? JSON.parse(row.selected_mcps) : null,
   };
 }
 
@@ -2092,14 +2226,14 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.initGitUrl ?? null,
     group.created_by ?? null,
     group.is_home ? 1 : 0,
-    group.selected_skills ? JSON.stringify(group.selected_skills) : null,
+    null, // selected_skills: deprecated, always null (user-level skills apply globally)
     group.target_agent_id ?? null,
     group.target_main_jid ?? null,
     group.reply_policy ?? 'source_only',
     group.require_mention === true ? 1 : 0,
     group.activation_mode ?? 'auto',
-    group.mcp_mode ?? 'inherit',
-    group.selected_mcps ? JSON.stringify(group.selected_mcps) : null,
+    'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
+    null, // selected_mcps: deprecated, always null
   );
 }
 
@@ -2354,14 +2488,16 @@ export function getMessagesPage(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const sql = before
     ? `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
       FROM messages
       WHERE chat_jid = ? AND timestamp < ?
       ORDER BY timestamp DESC
       LIMIT ?
     `
     : `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
       FROM messages
       WHERE chat_jid = ?
       ORDER BY timestamp DESC
@@ -2390,7 +2526,8 @@ export function getMessagesAfter(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid = ? AND timestamp > ?
        ORDER BY timestamp ASC
@@ -2417,12 +2554,14 @@ export function getMessagesPageMulti(
 
   const placeholders = chatJids.map(() => '?').join(',');
   const sql = before
-    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp < ?
        ORDER BY timestamp DESC
        LIMIT ?`
-    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid IN (${placeholders})
        ORDER BY timestamp DESC
@@ -2453,7 +2592,8 @@ export function getMessagesAfterMulti(
   const placeholders = chatJids.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp > ?
        ORDER BY timestamp ASC
@@ -2501,7 +2641,8 @@ export function getMessagesByTimeRange(
   const endIso = new Date(endTs).toISOString();
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
        ORDER BY timestamp ASC
@@ -2554,9 +2695,6 @@ export function getGroupsByOwner(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
-    selected_skills: row.selected_skills
-      ? JSON.parse(row.selected_skills)
-      : null,
   }));
 }
 
@@ -2617,6 +2755,8 @@ function mapUserRow(row: Record<string, unknown>): User {
       typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
     avatar_color:
       typeof row.avatar_color === 'string' ? row.avatar_color : null,
+    avatar_url:
+      typeof row.avatar_url === 'string' ? row.avatar_url : null,
     ai_name: typeof row.ai_name === 'string' ? row.ai_name : null,
     ai_avatar_emoji:
       typeof row.ai_avatar_emoji === 'string' ? row.ai_avatar_emoji : null,
@@ -2647,6 +2787,7 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     notes: user.notes,
     avatar_emoji: user.avatar_emoji,
     avatar_color: user.avatar_color,
+    avatar_url: user.avatar_url,
     ai_name: user.ai_name,
     ai_avatar_emoji: user.ai_avatar_emoji,
     ai_avatar_color: user.ai_avatar_color,
@@ -3032,6 +3173,7 @@ export function updateUserFields(
       | 'avatar_emoji'
       | 'avatar_color'
       | 'feishu_open_id'
+      | 'avatar_url'
       | 'ai_name'
       | 'ai_avatar_emoji'
       | 'ai_avatar_color'
@@ -3094,6 +3236,10 @@ export function updateUserFields(
   if (updates.feishu_open_id !== undefined) {
     fields.push('feishu_open_id = ?');
     values.push(updates.feishu_open_id);
+  }
+  if (updates.avatar_url !== undefined) {
+    fields.push('avatar_url = ?');
+    values.push(updates.avatar_url);
   }
   if (updates.ai_name !== undefined) {
     fields.push('ai_name = ?');
@@ -3168,14 +3314,7 @@ export function createUserSession(session: UserSession): void {
 export function getSessionWithUser(
   sessionId: string,
 ): UserSessionWithUser | undefined {
-  const row = db
-    .prepare(
-      `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password
-       FROM user_sessions s
-       JOIN users u ON s.user_id = u.id
-       WHERE s.id = ?`,
-    )
-    .get(sessionId) as Record<string, unknown> | undefined;
+  const row = stmts().getSessionWithUser.get(sessionId) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   const role = parseUserRole(row.role);
   return {
@@ -3204,7 +3343,7 @@ export function getUserSessions(userId: string): UserSession[] {
 }
 
 export function deleteUserSession(sessionId: string): void {
-  db.prepare('DELETE FROM user_sessions WHERE id = ?').run(sessionId);
+  stmts().deleteSession.run(sessionId);
 }
 
 export function deleteUserSessionsByUserId(userId: string): void {
@@ -3212,9 +3351,13 @@ export function deleteUserSessionsByUserId(userId: string): void {
 }
 
 export function updateSessionLastActive(sessionId: string): void {
-  db.prepare('UPDATE user_sessions SET last_active_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    sessionId,
+  stmts().updateSessionLastActive.run(new Date().toISOString(), sessionId);
+}
+
+export function getExpiredSessionIds(): string[] {
+  const now = new Date().toISOString();
+  return (stmts().getExpiredSessionIds.all(now) as { id: string }[]).map(
+    (r) => r.id,
   );
 }
 
@@ -3681,8 +3824,8 @@ export function getUserMemberFolders(
 
 export function createAgent(agent: SubAgent): void {
   db.prepare(
-    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     agent.id,
     agent.group_folder,
@@ -3695,6 +3838,7 @@ export function createAgent(agent: SubAgent): void {
     agent.created_at,
     agent.completed_at ?? null,
     agent.result_summary ?? null,
+    agent.spawned_from_jid ?? null,
   );
 }
 
@@ -3734,6 +3878,16 @@ export function updateAgentStatus(
   ).run(status, completedAt, resultSummary ?? null, id);
 }
 
+export function updateAgentLastImJid(
+  id: string,
+  lastImJid: string | null,
+): void {
+  db.prepare('UPDATE agents SET last_im_jid = ? WHERE id = ?').run(
+    lastImJid,
+    id,
+  );
+}
+
 export function updateAgentInfo(
   id: string,
   name: string,
@@ -3746,10 +3900,10 @@ export function updateAgentInfo(
   );
 }
 
-export function deleteCompletedTaskAgents(beforeTimestamp: string): number {
+export function deleteCompletedAgents(beforeTimestamp: string): number {
   const result = db
     .prepare(
-      "DELETE FROM agents WHERE kind = 'task' AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
+      "DELETE FROM agents WHERE kind IN ('task', 'spawn') AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
     )
     .run(beforeTimestamp);
   return result.changes;
@@ -3786,6 +3940,34 @@ export function markAllRunningTaskAgentsAsError(
   return result.changes;
 }
 
+/**
+ * Mark stale spawn agents (idle/running) as error at startup.
+ * After a process restart, spawn agents that were idle or running can never
+ * resume — their in-memory task callbacks are lost. Mark them as error so
+ * they don't render as "正在思考..." in the frontend.
+ */
+export function markStaleSpawnAgentsAsError(
+  summary = '进程重启，并行任务中断',
+): number {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind = 'spawn' AND status IN ('idle', 'running')",
+    )
+    .run(now, summary);
+  return result.changes;
+}
+
+export function listActiveConversationAgents(): SubAgent[] {
+  return (
+    db
+      .prepare(
+        "SELECT * FROM agents WHERE kind IN ('conversation', 'spawn') AND status IN ('running', 'idle')",
+      )
+      .all() as Record<string, unknown>[]
+  ).map(mapAgentRow);
+}
+
 export function deleteAgent(id: string): void {
   // Delete associated session
   db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
@@ -3807,6 +3989,10 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.completed_at === 'string' ? row.completed_at : null,
     result_summary:
       typeof row.result_summary === 'string' ? row.result_summary : null,
+    last_im_jid:
+      typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
+    spawned_from_jid:
+      typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
   };
 }
 
@@ -5194,6 +5380,8 @@ export function tryIncrementRedeemCodeUsage(
  * Should be called during graceful shutdown.
  */
 export function closeDatabase(): void {
+  _stmts = null;
+  _newMsgStmtCache.clear();
   if (db) {
     db.close();
   }

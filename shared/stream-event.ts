@@ -15,12 +15,19 @@ export type StreamEventType =
   | 'hook_started' | 'hook_progress' | 'hook_response'
   | 'task_start' | 'task_notification'
   | 'todo_update'
-  | 'mode_change'
   | 'usage'
   | 'status' | 'init';
 
 export interface StreamEvent {
   eventType: StreamEventType;
+  /** Correlates all stream events for a single user turn. */
+  turnId?: string;
+  /** SDK session identifier if known. */
+  sessionId?: string;
+  /** SDK message uuid if known. */
+  messageUuid?: string;
+  /** Reserved — whether this event was synthesized locally rather than emitted directly by SDK semantics. */
+  isSynthetic?: boolean;
   text?: string;
   toolName?: string;
   toolUseId?: string;
@@ -41,8 +48,6 @@ export interface StreamEvent {
   isTeammate?: boolean;
   toolInput?: Record<string, unknown>;
   todos?: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
-  /** Permission mode change (e.g. agent called ExitPlanMode/EnterPlanMode) */
-  permissionMode?: string;
   /** Token usage data emitted at query completion */
   usage?: {
     inputTokens: number;

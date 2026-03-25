@@ -9,7 +9,7 @@ import {
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
-import { DATA_DIR, GROUPS_DIR } from '../config.js';
+import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -153,7 +153,6 @@ interface GroupPayloadItem {
   is_shared?: boolean;
   member_role?: 'owner' | 'member';
   member_count?: number;
-  selected_skills?: string[] | null;
   pinned_at?: string;
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
@@ -262,7 +261,6 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
-      selected_skills: group.selected_skills ?? null,
       pinned_at: pins[jid] || undefined,
       activation_mode: group.activation_mode ?? 'auto',
     };
@@ -379,7 +377,8 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  const executionMode = validation.data.execution_mode || 'container';
+  // If user didn't specify execution mode, pick based on Docker availability
+  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -698,28 +697,44 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
 
   const {
     name: rawName,
-    selected_skills,
     is_pinned,
     activation_mode,
+    execution_mode,
   } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
   // 至少需要提供一个字段
   if (
     !name &&
-    selected_skills === undefined &&
     is_pinned === undefined &&
-    activation_mode === undefined
+    activation_mode === undefined &&
+    execution_mode === undefined
   ) {
     return c.json({ error: 'No fields to update' }, 400);
+  }
+
+  // 不允许修改 is_home=true 的主容器执行模式（主容器由 loadState 强制管理）
+  if (execution_mode !== undefined && existing.is_home) {
+    return c.json(
+      { error: 'Cannot change execution mode of home containers' },
+      403,
+    );
+  }
+
+  // member 用户不允许使用 host 模式（安全限制）
+  if (execution_mode === 'host' && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
   }
 
   // Pin/unpin only requires canAccessGroup (it's a per-user preference)
   const isPinOnly =
     is_pinned !== undefined &&
     !name &&
-    selected_skills === undefined &&
-    activation_mode === undefined;
+    activation_mode === undefined &&
+    execution_mode === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -761,27 +776,22 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
-  // Update registered group if name, skills, or activation_mode changed
-  if (
-    name ||
-    selected_skills !== undefined ||
-    activation_mode !== undefined
-  ) {
+  // Update registered group if name, activation_mode, or execution_mode changed
+  if (name || activation_mode !== undefined || execution_mode !== undefined) {
     const updated: RegisteredGroup = {
       name: name || existing.name,
       folder: existing.folder,
       added_at: existing.added_at,
       containerConfig: existing.containerConfig,
-      executionMode: existing.executionMode,
+      executionMode:
+        execution_mode !== undefined
+          ? (execution_mode as ExecutionMode)
+          : existing.executionMode,
       customCwd: existing.customCwd,
       initSourcePath: existing.initSourcePath,
       initGitUrl: existing.initGitUrl,
       created_by: existing.created_by,
       is_home: existing.is_home,
-      selected_skills:
-        selected_skills !== undefined
-          ? (selected_skills ?? null)
-          : existing.selected_skills,
       target_agent_id: existing.target_agent_id,
       target_main_jid: existing.target_main_jid,
       reply_policy: existing.reply_policy,
@@ -1431,8 +1441,8 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     updated.anthropicApiKey = data.anthropicApiKey;
   if (data.claudeCodeOauthToken !== undefined)
     updated.claudeCodeOauthToken = data.claudeCodeOauthToken;
-  if (data.happyclawModel !== undefined)
-    updated.happyclawModel = data.happyclawModel;
+  if (data.anthropicModel !== undefined)
+    updated.anthropicModel = data.anthropicModel;
   if (data.customEnv !== undefined) updated.customEnv = data.customEnv;
 
   try {
@@ -1599,41 +1609,6 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
   return c.json({ success: true, members });
 });
 
-// ─── Permission Mode (Code / Plan mode switching) ────────────────
-
-const VALID_PERMISSION_MODES = ['bypassPermissions', 'plan'];
-
-groupRoutes.put('/:jid/mode', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  const jid = decodeURIComponent(c.req.param('jid'));
-
-  const group = getRegisteredGroup(jid);
-  if (!group) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-  if (!canAccessGroup(user, { ...group, jid })) {
-    return c.json({ error: 'Not authorized' }, 403);
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const mode = (body as { mode?: string }).mode;
-
-  if (!mode || !VALID_PERMISSION_MODES.includes(mode)) {
-    return c.json(
-      {
-        error: `Invalid mode. Must be one of: ${VALID_PERMISSION_MODES.join(', ')}`,
-      },
-      400,
-    );
-  }
-
-  const deps = getWebDeps();
-  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
-
-  const sent = deps.queue.setPermissionMode(jid, mode);
-  return c.json({ success: true, mode, applied: sent });
-});
-
 // --- MCP Configuration Routes ---
 
 // GET /api/groups/:jid/mcp - 获取工作区 MCP 配置
@@ -1699,32 +1674,6 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
     mcp_mode: updatedGroup.mcp_mode,
     selected_mcps: updatedGroup.selected_mcps,
   });
-});
-
-// POST /api/groups/:jid/stop - 停止工作区容器/进程（下次发送消息时自动重启）
-groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  const deps = getWebDeps();
-  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
-
-  try {
-    await deps.queue.stopGroup(jid);
-    return c.json({
-      success: true,
-      message: 'Container stopped. It will restart on the next message.',
-    });
-  } catch (err) {
-    logger.error({ jid, err }, 'Failed to stop group');
-    return c.json({ error: 'Failed to stop container' }, 500);
-  }
 });
 
 export default groupRoutes;

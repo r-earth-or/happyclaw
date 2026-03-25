@@ -16,8 +16,12 @@ export function NavRail() {
   const [showBugReport, setShowBugReport] = useState(false);
 
   const navItems = useMemo(
-    () => baseNavItems.filter((item) => !item.requiresBilling || billingEnabled),
-    [billingEnabled],
+    () => baseNavItems.filter((item) => {
+      if (item.requiresBilling && !billingEnabled) return false;
+      if (item.requireAdmin && user?.role !== 'admin') return false;
+      return true;
+    }),
+    [billingEnabled, user?.role],
   );
 
   const userInitial = (user?.display_name || user?.username || '?')[0].toUpperCase();
@@ -83,7 +87,7 @@ export function NavRail() {
             <TooltipTrigger asChild>
               <button
                 onClick={() => navigate('/settings?tab=profile')}
-                className="rounded-lg hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer"
+                className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer"
               >
                 <EmojiAvatar
                   emoji={user?.avatar_emoji}

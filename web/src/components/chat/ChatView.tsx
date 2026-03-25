@@ -4,22 +4,21 @@ import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
-import { StreamingDisplay } from './StreamingDisplay';
-
 import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
-import { ArrowLeft, FolderOpen, Link, MessageSquare, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Server, Sun, Terminal, Users, Variable, X, Zap } from 'lucide-react';
+import { PromptDialog } from '@/components/common/PromptDialog';
+import { ArrowLeft, FolderOpen, Link, MessageSquare, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Puzzle, Server, Sun, Terminal, Users, Variable, X } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useTheme } from '../../hooks/useTheme';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
 import { TerminalPanel } from './TerminalPanel';
-import { GroupSkillsPanel } from './GroupSkillsPanel';
-import { GroupMcpPanel } from './GroupMcpPanel';
 import { GroupMembersPanel } from './GroupMembersPanel';
+import { WorkspaceSkillsPanel } from './WorkspaceSkillsPanel';
+import { WorkspaceMcpPanel } from './WorkspaceMcpPanel';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { AgentTabBar } from './AgentTabBar';
 import { ImBindingDialog } from './ImBindingDialog';
@@ -31,25 +30,10 @@ const MAIN_BINDING = '__main__' as const;
 const SIDEBAR_TABS = [
   { id: 'files' as const, icon: FolderOpen, label: '文件管理' },
   { id: 'env' as const, icon: Variable, label: '环境变量' },
-  { id: 'skills' as const, icon: Zap, label: '技能' },
-  { id: 'mcp' as const, icon: Server, label: 'MCP 服务器' },
+  { id: 'skills' as const, icon: Puzzle, label: '工作区 Skills' },
+  { id: 'mcp' as const, icon: Server, label: '工作区 MCP' },
   { id: 'members' as const, icon: Users, label: '成员' },
 ];
-
-/** Inline elapsed-time counter for running tasks */
-function ElapsedTimer({ startTime }: { startTime: number }) {
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const tick = () => setElapsed(Math.floor((Date.now() - startTime) / 1000));
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, [startTime]);
-
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
-  return <span>{mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}</span>;
-}
 
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
@@ -84,8 +68,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   // null = dialog closed; MAIN_BINDING = main conversation; other = agent id
   const [bindingAgentId, setBindingAgentId] = useState<string | null>(null);
-  // Code / Plan mode toggle (per group)
-  const [permissionMode, setPermissionMode] = useState<'bypassPermissions' | 'plan'>('bypassPermissions');
+  const [showNewConversation, setShowNewConversation] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<{ agentId: string; name: string } | null>(null);
   const [imStatus, setImStatus] = useState<{ feishu: boolean; telegram: boolean } | null>(null);
   const [imBannerDismissed, setImBannerDismissed] = useState(() =>
     localStorage.getItem('im-banner-dismissed') === '1',
@@ -111,17 +95,18 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
+  const handleStreamSnapshot = useChatStore(s => s.handleStreamSnapshot);
 
-  const clearStreaming = useChatStore(s => s.clearStreaming);
   const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
   const setActiveAgentTab = useChatStore(s => s.setActiveAgentTab);
   const loadAgents = useChatStore(s => s.loadAgents);
   const deleteAgentAction = useChatStore(s => s.deleteAgentAction);
   const agentStreaming = useChatStore(s => s.agentStreaming);
-  const sdkTasks = useChatStore(s => s.sdkTasks);
   const createConversation = useChatStore(s => s.createConversation);
+  const renameConversation = useChatStore(s => s.renameConversation);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
   const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
   const agentMessages = useChatStore(s => s.agentMessages);
   const agentWaiting = useChatStore(s => s.agentWaiting);
@@ -213,15 +198,27 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     restoreActiveState();
     const unsub = wsManager.on('connected', () => {
       restoreActiveState();
+      // Reconcile agent list with backend truth — picks up any agent_status
+      // events that were missed during WS disconnection.
+      loadAgents(groupJid);
+      // Refresh conversation agent messages that may have been missed during WS disconnection
+      const state = useChatStore.getState();
+      const currentTab = state.activeAgentTab[groupJid];
+      if (currentTab) {
+        const agentInfo = (state.agents[groupJid] || []).find(a => a.id === currentTab);
+        if (agentInfo?.kind === 'conversation') {
+          refreshAgentMessages(groupJid, currentTab);
+        }
+      }
     });
     return () => { unsub(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [groupJid]);
 
   // Derived: active agent info and kind
   const activeAgent = activeAgentTab ? agents.find(a => a.id === activeAgentTab) : null;
   const isConversationTab = activeAgent?.kind === 'conversation';
-  const isSdkTask = !!activeAgentTab && !!sdkTasks[activeAgentTab];
+  // SDK Tasks 不再创建独立标签页，事件直接显示在主对话流式卡片中
 
   // Load sub-agents for this group
   useEffect(() => {
@@ -243,32 +240,35 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     const unsub1 = wsManager.on('stream_event', (data: any) => {
       if (data.chatJid === groupJid) {
         handleStreamEvent(groupJid, data.event, data.agentId);
-        // Sync permission mode when agent calls ExitPlanMode/EnterPlanMode
-        if (data.event?.eventType === 'mode_change' && data.event?.permissionMode) {
-          const newMode = data.event.permissionMode as 'bypassPermissions' | 'plan';
-          setPermissionMode(newMode);
-        }
       }
     });
-    // agent_reply 作为 fallback：如果 new_message 已处理则为 no-op
-    const unsub2 = wsManager.on('agent_reply', (data: any) => {
-      if (data.chatJid === groupJid) clearStreaming(groupJid);
-    });
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
-    const unsub3 = wsManager.on('new_message', (data: any) => {
+    const unsub2 = wsManager.on('new_message', (data: any) => {
       if (data.chatJid === groupJid && data.message) {
         handleWsNewMessage(groupJid, data.message, data.agentId, data.source);
       }
     });
     // WebSocket 消息校验失败时通知用户
-    const unsub4 = wsManager.on('ws_error', (data: any) => {
+    const unsub3 = wsManager.on('ws_error', (data: any) => {
       if (!data.chatJid || data.chatJid === groupJid) {
         showToast('发送失败', data.error || '消息格式无效', 4000);
       }
     });
+    // 后端推送的流式快照（WS 重连时恢复）
+    const agentSnapshotPrefix = groupJid + '#agent:';
+    const unsub4 = wsManager.on('stream_snapshot', (data: any) => {
+      if (!data.snapshot) return;
+      if (data.chatJid === groupJid) {
+        handleStreamSnapshot(groupJid, data.snapshot);
+      } else if (typeof data.chatJid === 'string' && data.chatJid.startsWith(agentSnapshotPrefix)) {
+        // Agent-specific snapshot: extract agentId and restore agentStreaming
+        const snapshotAgentId = data.chatJid.slice(agentSnapshotPrefix.length);
+        handleStreamSnapshot(groupJid, data.snapshot, snapshotAgentId);
+      }
+    });
     // agent_status 已提升到 AppLayout 全局监听
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage, clearStreaming]);
+  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleStreamSnapshot]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
@@ -289,24 +289,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     setResetLoading(false);
     setShowResetConfirm(false);
     setResetAgentId(null);
-  };
-
-  const togglePermissionMode = async () => {
-    const newMode = permissionMode === 'bypassPermissions' ? 'plan' : 'bypassPermissions';
-    setPermissionMode(newMode);
-    try {
-      const res = await api.put<{ success: boolean; mode: string; applied: boolean }>(
-        `/api/groups/${encodeURIComponent(groupJid)}/mode`, { mode: newMode },
-      );
-      if (res.applied === false) {
-        const label = newMode === 'plan' ? 'Plan' : 'Code';
-        showToast(`已切换到 ${label} 模式`, '容器未运行，模式将在下次启动时生效');
-      }
-    } catch {
-      // Revert on failure
-      setPermissionMode(permissionMode);
-      showToast('模式切换失败', '请稍后重试');
-    }
   };
 
   // --- Drag resize handlers (mouse + touch) ---
@@ -404,7 +386,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     return (
       <div className="h-full flex items-center justify-center bg-background">
         <div className="text-center">
-          <p className="text-slate-500">群组不存在</p>
+          <p className="text-muted-foreground">群组不存在</p>
         </div>
       </div>
     );
@@ -417,20 +399,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         {onBack && (
           <button
             onClick={onBack}
-            className="lg:hidden p-2 -ml-2 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+            className="lg:hidden p-2 -ml-2 hover:bg-muted rounded-lg transition-colors cursor-pointer"
             aria-label="返回"
           >
-            <ArrowLeft className="w-5 h-5 text-slate-600" />
+            <ArrowLeft className="w-5 h-5 text-foreground/70" />
           </button>
         )}
         {headerLeft}
         <div className="flex-1 min-w-0">
-          <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
-          <div className="flex items-center gap-1.5 text-xs text-slate-500">
-            <span>{isWaiting ? '正在思考...' : group.is_home ? '主工作区' : '工作区'}</span>
+          <h2 className="font-semibold text-foreground text-[15px] truncate">{group.name}</h2>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span>{isWaiting ? '正在思考...' : group.is_home ? '主 Agent' : 'Agent'}</span>
             {!isWaiting && group.is_shared && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 <span className="inline-flex items-center gap-0.5">
                   <Users className="w-3 h-3" />
                   {group.member_count ?? 0} 人协作
@@ -439,7 +421,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
             {!isWaiting && group.execution_mode && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 <span className={`inline-flex items-center px-1 py-px rounded text-[10px] font-medium ${group.execution_mode === 'host' ? 'bg-amber-100 text-amber-700' : 'bg-sky-100 text-sky-700'}`}>
                   {group.execution_mode === 'host' ? '宿主机' : 'Docker'}
                 </span>
@@ -447,7 +429,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
             {isOwnHome && imStatus && (imStatus.feishu || imStatus.telegram) && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 {imStatus.feishu && (
                   <span className="inline-flex items-center gap-0.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
@@ -537,20 +519,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           const agent = agents.find((a) => a.id === id);
           if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
             const names = agent.linked_im_groups.map((g) => g.name).join('、');
-            alert(`该对话已绑定 IM 群组（${names}），请先解绑后再删除。`);
+            alert(`该对话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
             setBindingAgentId(id);
             return;
           }
           deleteAgentAction(groupJid, id);
         }}
-        onCreateConversation={() => {
-          const name = prompt('对话名称：');
-          if (name?.trim()) {
-            createConversation(groupJid, name.trim()).then((agent) => {
-              if (agent) setActiveAgentTab(groupJid, agent.id);
-            });
-          }
-        }}
+        onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
+        onCreateConversation={() => setShowNewConversation(true)}
         onBindIm={setBindingAgentId}
         onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
       />
@@ -583,141 +559,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 onResetSession={() => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); }}
               />
             </>
-          ) : activeAgentTab ? (
-            /* Task agent tab */
-            <>
-              {isSdkTask ? (
-                /* SDK Task: 流式展示或状态反馈 */
-                <div className="flex-1 overflow-y-auto p-4">
-                  {(() => {
-                    const streamState = agentStreaming[activeAgentTab];
-                    const hasStreamContent = streamState && (
-                      streamState.partialText
-                      || streamState.thinkingText
-                      || streamState.activeTools.length > 0
-                      || !!streamState.activeHook
-                      || !!streamState.systemStatus
-                      || streamState.recentEvents.length > 0
-                    );
-                    const task = sdkTasks[activeAgentTab];
-                    const taskStatus = task?.status;
-
-                    if (taskStatus === 'completed') {
-                      return (
-                        <div className="text-center py-8 space-y-2">
-                          <div className="text-sm font-medium text-emerald-600">子 Agent 已完成</div>
-                          {task?.summary && (
-                            <div className="text-xs text-slate-500 max-w-md mx-auto">{task.summary}</div>
-                          )}
-                        </div>
-                      );
-                    }
-
-                    if (taskStatus === 'error') {
-                      return (
-                        <div className="text-center py-8 space-y-2">
-                          <div className="text-sm font-medium text-red-600">子 Agent 执行出错</div>
-                          {task?.summary && (
-                            <div className="text-xs text-slate-500 max-w-md mx-auto">{task.summary}</div>
-                          )}
-                        </div>
-                      );
-                    }
-
-                    if (hasStreamContent) {
-                      // 有流式数据 → 显示 StreamingDisplay（前台任务场景）
-                      return (
-                        <StreamingDisplay
-                          groupJid={groupJid}
-                          isWaiting={taskStatus === 'running'}
-                          agentId={activeAgentTab}
-                        />
-                      );
-                    }
-
-                    // running 状态：显示描述 + 实时计时 + 后台任务说明
-                    return (
-                      <div className="flex flex-col items-center justify-center py-12 px-4 space-y-4">
-                        {/* 动画 spinner */}
-                        <div className="relative">
-                          <div className="w-12 h-12 rounded-full border-2 border-teal-100" />
-                          <div className="absolute inset-0 w-12 h-12 rounded-full border-2 border-transparent border-t-teal-500 animate-spin" />
-                        </div>
-
-                        <div className="text-center space-y-2 max-w-md">
-                          <div className="text-sm font-medium text-slate-700">
-                            Teammate 正在后台执行中
-                          </div>
-                          {task?.description && (
-                            <div className="text-xs text-slate-500 leading-relaxed">
-                              {task.description}
-                            </div>
-                          )}
-                        </div>
-
-                        {/* 实时计时器 */}
-                        {task?.startedAt && (
-                          <div className="text-xs text-slate-400 tabular-nums">
-                            已运行 <ElapsedTimer startTime={task.startedAt} />
-                          </div>
-                        )}
-
-                        <div className="text-[11px] text-slate-400 text-center max-w-sm leading-relaxed">
-                          后台任务不传播中间过程，完成后将显示结果摘要
-                        </div>
-                      </div>
-                    );
-                  })()}
-                </div>
-              ) : (
-                /* DB Task: read-only — show agent's messages from main chat */
-                <MessageList
-                  key={`task-${activeAgentTab}`}
-                  messages={(groupMessages || []).filter(
-                    (m) => m.sender === `agent:${activeAgentTab}`,
-                  )}
-                  loading={false}
-                  hasMore={false}
-                  onLoadMore={() => {}}
-                  scrollTrigger={scrollTrigger}
-                  groupJid={groupJid}
-                  isWaiting={!!agentStreaming[activeAgentTab]}
-                  onInterrupt={() => interruptQuery(groupJid)}
-                  agentId={activeAgentTab}
-                />
-              )}
-              {(() => {
-                const activeSdkTask = activeAgentTab ? sdkTasks[activeAgentTab] : null;
-                if (isSdkTask && activeSdkTask?.isTeammate && activeSdkTask?.status === 'running') {
-                  return (
-                    /* Teammate 标签页：通过主对话中转发送消息给 Team Lead */
-                    <div className="border-t">
-                      <div className="px-4 pt-1.5 pb-0.5 text-[10px] text-amber-600 bg-amber-50/50 text-center">
-                        消息将发送到主对话，由 Team Lead 转发
-                      </div>
-                      <MessageInput
-                        onSend={async (content) => {
-                          const taskDesc = (activeSdkTask?.description || 'Teammate').replace(/"/g, '\\"');
-                          const wrappedContent = `[发送给 Teammate "${taskDesc}"]: ${content}`;
-                          await sendMessage(groupJid, wrappedContent);
-                          setScrollTrigger(n => n + 1);
-                        }}
-                        groupJid={groupJid}
-                      />
-                    </div>
-                  );
-                }
-                return (
-                  <div className="px-4 py-2 text-center text-xs text-slate-400 border-t">
-                    {isSdkTask
-                      ? (activeSdkTask?.status === 'running'
-                        ? '子 Agent 独立运行中 — 仅主对话可发送消息'
-                        : '子 Agent 已结束 — 仅主对话可发送消息')
-                      : '子 Agent 独立运行中 — 仅主对话可发送消息'}
-                  </div>
-                );
-              })()}
-            </>
           ) : (
             /* Main conversation tab */
             <>
@@ -731,8 +572,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 groupJid={groupJid}
                 isWaiting={isWaiting}
                 onInterrupt={() => interruptQuery(groupJid)}
-                agents={agents}
-                onAgentClick={(agentId) => setActiveAgentTab(groupJid, agentId)}
                 onSend={(content) => handleSend(content)}
               />
               <MessageInput
@@ -740,8 +579,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 groupJid={groupJid}
                 onResetSession={() => { setResetAgentId(null); setShowResetConfirm(true); }}
                 onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
-                permissionMode={permissionMode}
-                onTogglePermissionMode={togglePermissionMode}
               />
             </>
           )}
@@ -788,12 +625,12 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <FilePanel groupJid={groupJid} />
             ) : sidebarTab === 'env' ? (
               <ContainerEnvPanel groupJid={groupJid} />
+            ) : sidebarTab === 'skills' ? (
+              <WorkspaceSkillsPanel groupJid={groupJid} />
             ) : sidebarTab === 'mcp' ? (
-              <GroupMcpPanel groupJid={groupJid} />
-            ) : sidebarTab === 'members' ? (
-              <GroupMembersPanel groupJid={groupJid} />
+              <WorkspaceMcpPanel groupJid={groupJid} />
             ) : (
-              <GroupSkillsPanel groupJid={groupJid} />
+              <GroupMembersPanel groupJid={groupJid} />
             )}
           </div>
         </div>
@@ -809,13 +646,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               onTouchStart={handleTouchDragStart}
               className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
             >
-              <div className="w-8 h-0.5 rounded-full bg-slate-400 group-hover:bg-primary transition-colors" />
+              <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
             </div>
           )}
           {/* Terminal panel */}
           <div
             className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
-              terminalVisible ? 'border-t border-slate-300' : 'border-t-0'
+              terminalVisible ? 'border-t border-border' : 'border-t-0'
             }`}
             style={{ height: terminalVisible ? terminalHeight : 0 }}
           >
@@ -866,11 +703,12 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       <Sheet open={mobilePanel === 'skills'} onOpenChange={(v) => !v && setMobilePanel(null)}>
         <SheetContent side="bottom" className="h-[80dvh] p-0">
           <SheetHeader className="px-4 pt-4 pb-2">
-            <SheetTitle>技能管理</SheetTitle>
+            <SheetTitle>工作区 Skills</SheetTitle>
           </SheetHeader>
           <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
-            <GroupSkillsPanel
+            <WorkspaceSkillsPanel
               groupJid={groupJid}
+              onClose={() => setMobilePanel(null)}
             />
           </div>
         </SheetContent>
@@ -880,10 +718,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       <Sheet open={mobilePanel === 'mcp'} onOpenChange={(v) => !v && setMobilePanel(null)}>
         <SheetContent side="bottom" className="h-[80dvh] p-0">
           <SheetHeader className="px-4 pt-4 pb-2">
-            <SheetTitle>MCP 服务器</SheetTitle>
+            <SheetTitle>工作区 MCP Servers</SheetTitle>
           </SheetHeader>
           <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
-            <GroupMcpPanel groupJid={groupJid} />
+            <WorkspaceMcpPanel
+              groupJid={groupJid}
+              onClose={() => setMobilePanel(null)}
+            />
           </div>
         </SheetContent>
       </Sheet>
@@ -940,13 +781,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               onClick={() => { setMobileActionsOpen(false); setMobilePanel('skills'); }}
               className="w-full text-left px-4 py-3 rounded-lg border border-border hover:bg-accent transition-colors cursor-pointer text-foreground text-sm"
             >
-              技能
+              工作区 Skills
             </button>
             <button
               onClick={() => { setMobileActionsOpen(false); setMobilePanel('mcp'); }}
               className="w-full text-left px-4 py-3 rounded-lg border border-border hover:bg-accent transition-colors cursor-pointer text-foreground text-sm"
             >
-              MCP 服务器
+              工作区 MCP
             </button>
             {showMembersTab && (
               <button
@@ -996,6 +837,31 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           onClose={() => setBindingAgentId(null)}
         />
       )}
+
+      <PromptDialog
+        open={showNewConversation}
+        title="新建对话"
+        label="对话名称"
+        placeholder="输入对话名称"
+        onConfirm={(name) => {
+          createConversation(groupJid, name).then((agent) => {
+            if (agent) setActiveAgentTab(groupJid, agent.id);
+          });
+        }}
+        onClose={() => setShowNewConversation(false)}
+      />
+
+      <PromptDialog
+        open={renameTarget !== null}
+        title="重命名对话"
+        label="对话名称"
+        placeholder="输入新名称"
+        defaultValue={renameTarget?.name ?? ''}
+        onConfirm={(name) => {
+          if (renameTarget) renameConversation(groupJid, renameTarget.agentId, name);
+        }}
+        onClose={() => setRenameTarget(null)}
+      />
     </div>
   );
 }

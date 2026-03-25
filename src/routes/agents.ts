@@ -20,11 +20,15 @@ import {
   getGroupsByTargetAgent,
   setRegisteredGroup,
   getJidsByFolder,
+  updateAgentLastImJid,
+  updateAgentInfo,
+  updateChatName,
 } from '../db.js';
 import { DATA_DIR } from '../config.js';
 import type { RegisteredGroup, SubAgent } from '../types.js';
 import { logger } from '../logger.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
+import { ensureAgentDirectories } from '../utils.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -107,32 +111,14 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
     created_at: now,
     completed_at: null,
     result_summary: null,
+    last_im_jid: null,
+    spawned_from_jid: null,
   };
 
   createAgent(agent);
 
-  // Create IPC directories for this conversation agent
-  const agentIpcDir = path.join(
-    DATA_DIR,
-    'ipc',
-    group.folder,
-    'agents',
-    agentId,
-  );
-  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
-
-  // Create session directory
-  const agentSessionDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agents',
-    agentId,
-    '.claude',
-  );
-  fs.mkdirSync(agentSessionDir, { recursive: true });
+  // Create IPC + session directories
+  ensureAgentDirectories(group.folder, agentId);
 
   // Create virtual chat record for this agent's messages
   const virtualChatJid = `${jid}#agent:${agentId}`;
@@ -158,6 +144,46 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
       created_at: agent.created_at,
     },
   });
+});
+
+// PATCH /api/groups/:jid/agents/:agentId — rename a conversation agent
+router.patch('/:jid/agents/:agentId', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const agentId = c.req.param('agentId');
+  const user = c.get('user');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const agent = getAgent(agentId);
+  if (!agent || agent.chat_jid !== jid) {
+    return c.json({ error: 'Agent not found' }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 40) {
+    return c.json({ error: 'Name is required (max 40 chars)' }, 400);
+  }
+
+  // Update agent name in DB
+  updateAgentInfo(agentId, name, agent.prompt);
+
+  // Update virtual chat name
+  const virtualChatJid = `${jid}#agent:${agentId}`;
+  updateChatName(virtualChatJid, name);
+
+  // Broadcast update via WebSocket
+  const { broadcastAgentStatus } = await import('../web.js');
+  broadcastAgentStatus(jid, agentId, agent.status as import('../types.js').AgentStatus, name, agent.prompt);
+
+  logger.info({ agentId, jid, name, userId: user.id }, 'Agent renamed');
+  return c.json({ success: true });
 });
 
 // DELETE /api/groups/:jid/agents/:agentId — stop and delete an agent
@@ -308,6 +334,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     member_count?: number;
     channel_type: string;
     chat_mode?: string; // 'p2p' | 'group' — from Feishu API (distinguishes P2P vs group chat)
+    activation_mode?: string;
   }
 
   const candidates: ImGroupCandidate[] = [];
@@ -349,6 +376,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       bound_target_name: boundTargetName,
       bound_workspace_name: boundWorkspaceName,
       channel_type: getChannelType(j) ?? 'unknown',
+      activation_mode: g.activation_mode,
     });
   }
 
@@ -502,6 +530,9 @@ router.delete(
       if (groups[imJid]) groups[imJid] = updated;
     }
 
+    // Clear persisted IM routing so restart won't route to unbound channel (#225)
+    updateAgentLastImJid(agentId, null);
+
     logger.info(
       { imJid, agentId, userId: user.id },
       'IM group unbound from agent',
@@ -545,7 +576,11 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   const targetMainJid = jid; // Use actual registered JID (not folder-based)
   const legacyMainJid = `web:${group.folder}`;
   const force = body.force === true;
-  const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+  // Only update reply_policy if explicitly provided; otherwise preserve existing value
+  const replyPolicy =
+    body.reply_policy === 'mirror' ? 'mirror'
+    : body.reply_policy === 'source_only' ? 'source_only'
+    : undefined;
   const hasConflict =
     !!imGroup.target_agent_id ||
     (imGroup.target_main_jid &&
@@ -555,12 +590,21 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     return c.json({ error: 'IM group is already bound elsewhere' }, 409);
   }
 
+  // Parse activation_mode from request body
+  const validActivationModes = ['always', 'when_mentioned', 'auto', 'disabled'] as const;
+  const rawActivationMode = body.activation_mode;
+  const activationMode =
+    typeof rawActivationMode === 'string' && validActivationModes.includes(rawActivationMode as typeof validActivationModes[number])
+      ? (rawActivationMode as typeof validActivationModes[number])
+      : undefined;
+
   // Update DB + in-memory cache — clear target_agent_id to avoid conflicts
   const updated: RegisteredGroup = {
     ...imGroup,
     target_main_jid: targetMainJid,
     target_agent_id: undefined,
-    reply_policy: replyPolicy,
+    ...(replyPolicy !== undefined ? { reply_policy: replyPolicy } : {}),
+    ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
   };
   setRegisteredGroup(imJid, updated);
   const deps = getWebDeps();
@@ -570,7 +614,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   }
 
   logger.info(
-    { imJid, targetMainJid, userId: user.id },
+    { imJid, targetMainJid, activationMode, userId: user.id },
     'IM group bound to workspace main conversation',
   );
   return c.json({ success: true });
@@ -606,8 +650,8 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
     return c.json({ error: 'IM group is not bound to this workspace' }, 400);
   }
 
-  // Update DB + in-memory cache
-  const updated = { ...imGroup, target_main_jid: undefined };
+  // Update DB + in-memory cache — reset activation_mode to 'auto' on unbind
+  const updated = { ...imGroup, target_main_jid: undefined, activation_mode: 'auto' as const };
   setRegisteredGroup(imJid, updated);
   const deps = getWebDeps();
   if (deps) {

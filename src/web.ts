@@ -20,6 +20,8 @@ import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
   canAccessGroup,
+  getCachedSessionWithUser,
+  invalidateSessionCache,
 } from './web-context.js';
 
 // Schemas
@@ -47,6 +49,7 @@ import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
+import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
@@ -61,7 +64,6 @@ import {
   ensureChatExists,
   getRegisteredGroup,
   getJidsByFolder,
-  getSessionWithUser,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -79,9 +81,13 @@ import type {
   StreamEvent,
   UserRole,
 } from './types.js';
-import { WEB_PORT, SESSION_COOKIE_NAME, ASSISTANT_NAME } from './config.js';
+import {
+  WEB_PORT,
+  SESSION_COOKIE_NAME_SECURE,
+  SESSION_COOKIE_NAME_PLAIN,
+  ASSISTANT_NAME,
+} from './config.js';
 import { logger } from './logger.js';
-import { analyzeIntent } from './intent-analyzer.js';
 import { executeSessionReset } from './commands.js';
 import {
   normalizeImageAttachments,
@@ -169,6 +175,7 @@ app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
+app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
@@ -270,7 +277,7 @@ async function handleWebUserMessage(
     content,
     timestamp,
     false,
-    attachmentsStr,
+    { attachments: attachmentsStr },
   );
 
   broadcastNewMessage(chatJid, {
@@ -337,13 +344,11 @@ async function handleWebUserMessage(
   // longer need to kill and restart the process (#99).
   let pipedToActive = false;
   const images = toAgentImages(normalizedAttachments);
-  const intent = analyzeIntent(content);
   const updateRoute = deps.updateReplyRoute;
   const sendResult = deps.queue.sendMessage(
     chatJid,
     formatted,
     images,
-    intent,
     () => {
       // IPC write succeeded — update reply route for home groups.
       // Web messages have no IM source, so clear the IM route.
@@ -352,24 +357,18 @@ async function handleWebUserMessage(
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
-  } else if (sendResult === 'interrupted_stop') {
-    // Stop intent: cursor updated, no enqueue needed
-    pipedToActive = true;
-  } else if (sendResult === 'interrupted_correction') {
-    // Correction intent: IPC message written, agent handles it after interrupt
-    pipedToActive = true;
-  } else if (sendResult === 'queued') {
-    // Message queued for next container run; don't advance cursor so
-    // processGroupMessages re-reads it from DB. Drain sentinel already
-    // written — the current runner will exit and drainGroup picks it up.
   } else {
     deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
-  // For queued processing, processGroupMessages must still see this message from DB.
+  //
+  // When piped to active, we also mark the group as having pending IPC-injected
+  // messages. If the agent crashes without processing them, the close handler
+  // resets pendingMessages so drainGroup re-reads from DB.
   if (pipedToActive) {
     deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+    deps.queue.markIpcInjectedMessage(chatJid);
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
   return { ok: true, messageId, timestamp };
@@ -423,7 +422,7 @@ async function handleAgentConversationMessage(
     content,
     timestamp,
     false,
-    attachmentsStr,
+    { attachments: attachmentsStr },
   );
 
   // Broadcast new_message with agentId so frontend routes to agent tab
@@ -459,16 +458,16 @@ async function handleAgentConversationMessage(
   );
 
   // Try to pipe into running agent process
-  const agentIntent = analyzeIntent(content);
   const agentImages = toAgentImages(normalizedAttachments);
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
-    agentIntent,
   );
   if (agentSendResult === 'no_active') {
-    // No running process — start one via processAgentConversation
+    // No running process — force close any stale state and start fresh.
+    // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
+    deps.queue.closeStdin(virtualChatJid);
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
       deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
@@ -476,8 +475,7 @@ async function handleAgentConversationMessage(
       });
     }
   }
-  // 'sent', 'interrupted_stop', 'interrupted_correction' need no further action —
-  // for correction, the IPC message was written and the agent handles it after interrupt
+  // 'sent' needs no further action
 }
 
 // --- Static Files ---
@@ -541,23 +539,24 @@ function setupWebSocket(server: any): WebSocketServer {
 
     // Verify session cookie
     const cookies = parseCookie(request.headers.cookie);
-    const token = cookies[SESSION_COOKIE_NAME];
+    const token =
+      cookies[SESSION_COOKIE_NAME_SECURE] || cookies[SESSION_COOKIE_NAME_PLAIN];
     if (!token) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
 
-    const session = getSessionWithUser(token);
+    const session = getCachedSessionWithUser(token);
     if (!session) {
-      lastActiveCache.delete(token);
+      invalidateSessionCache(token);
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
     if (isSessionExpired(session.expires_at)) {
       deleteUserSession(token);
-      lastActiveCache.delete(token);
+      invalidateSessionCache(token);
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
@@ -577,12 +576,70 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
-    const connSession = sessionId ? getSessionWithUser(sessionId) : undefined;
+    const connSession = sessionId ? getCachedSessionWithUser(sessionId) : undefined;
     wsClients.set(ws, {
       sessionId: sessionId || '',
       userId: connSession?.user_id || '',
       role: (connSession?.role || 'member') as UserRole,
     });
+
+    // Push streaming snapshots for active groups this user can access
+    if (connSession && streamingSnapshots.size > 0) {
+      const userId = connSession.user_id;
+      for (const [jid, snap] of streamingSnapshots) {
+        // Skip stale snapshots (> 30 min)
+        // Extended from 5 min to 30 min to support long-running sub-agents.
+        // See GitHub issue #241.
+        if (Date.now() - snap.updatedAt > 30 * 60 * 1000) {
+          streamingSnapshots.delete(jid);
+          continue;
+        }
+        // Skip empty snapshots
+        if (!snap.partialText && snap.activeTools.length === 0 && snap.recentEvents.length === 0) {
+          continue;
+        }
+        // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
+        const baseJid = jid.includes('#agent:') ? jid.split('#agent:')[0] : jid;
+        const allowed = getGroupAllowedUserIds(baseJid);
+        if (allowed === null || !allowed.has(userId)) continue;
+        try {
+          ws.send(JSON.stringify({
+            type: 'stream_snapshot',
+            chatJid: jid,
+            snapshot: {
+              partialText: snap.partialText,
+              activeTools: snap.activeTools,
+              recentEvents: snap.recentEvents,
+              todos: snap.todos,
+              systemStatus: snap.systemStatus,
+              turnId: snap.turnId,
+            },
+          } satisfies WsMessageOut));
+        } catch { /* client not ready */ }
+      }
+    }
+
+    // Push runner_state: 'running' for all active groups on WS connect.
+    // This prevents a race where a late-arriving new_message clears
+    // waiting=false after snapshot restore, blocking all subsequent
+    // stream events. The runner_state event resets waiting=true.
+    if (connSession && deps) {
+      const userId = connSession.user_id;
+      const queueStatus = deps.queue.getStatus();
+      for (const g of queueStatus.groups) {
+        if (!g.active) continue;
+        const jid = normalizeHomeJid(g.jid);
+        const allowed = getGroupAllowedUserIds(g.jid);
+        if (allowed === null || !allowed.has(userId)) continue;
+        try {
+          ws.send(JSON.stringify({
+            type: 'runner_state',
+            chatJid: jid,
+            state: 'running',
+          } satisfies WsMessageOut));
+        } catch { /* client not ready */ }
+      }
+    }
 
     const cleanupTerminalForWs = () => {
       const termJid = wsTerminals.get(ws);
@@ -600,7 +657,7 @@ function setupWebSocket(server: any): WebSocketServer {
           return;
         }
 
-        const session = getSessionWithUser(sessionId);
+        const session = getCachedSessionWithUser(sessionId);
         if (
           !session ||
           isSessionExpired(session.expires_at) ||
@@ -609,7 +666,7 @@ function setupWebSocket(server: any): WebSocketServer {
           if (session && isSessionExpired(session.expires_at)) {
             deleteUserSession(sessionId);
           }
-          lastActiveCache.delete(sessionId);
+          invalidateSessionCache(sessionId);
           ws.close(1008, 'Unauthorized');
           return;
         }
@@ -677,6 +734,46 @@ function setupWebSocket(server: any): WebSocketServer {
             }
           }
 
+          // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
+          const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
+          if (swMatch && deps?.handleSpawnCommand) {
+            const spawnMessage = swMatch[2].trim();
+            if (spawnMessage) {
+              try {
+                // For agent tab, include agentId in chatJid so spawn resolves the right workspace
+                const effectiveChatJid = agentId
+                  ? `${chatJid}#agent:${agentId}`
+                  : chatJid;
+                // Store user's /sw message in the current chat so it's visible
+                const userMsgId = crypto.randomUUID();
+                const userMsgTs = new Date().toISOString();
+                ensureChatExists(effectiveChatJid);
+                storeMessageDirect(
+                  userMsgId, effectiveChatJid,
+                  session.user_id,
+                  session.display_name || session.username,
+                  content.trim(),
+                  userMsgTs,
+                  false,
+                  { meta: { sourceKind: 'user_command' } },
+                );
+                broadcastNewMessage(effectiveChatJid, {
+                  id: userMsgId, chat_jid: effectiveChatJid,
+                  sender: session.user_id,
+                  sender_name: session.display_name || session.username,
+                  content: content.trim(),
+                  timestamp: userMsgTs,
+                  is_from_me: false,
+                });
+
+                await deps.handleSpawnCommand(effectiveChatJid, spawnMessage);
+              } catch (err) {
+                logger.error({ chatJid, err }, '/sw command failed');
+              }
+            }
+            return;
+          }
+
           // Route to agent conversation handler if agentId is present
           if (agentId && deps) {
             await handleAgentConversationMessage(
@@ -691,7 +788,7 @@ function setupWebSocket(server: any): WebSocketServer {
           }
 
           // ── /clear command: reset session without entering message pipeline ──
-          if (content.trim() === '/clear' && deps) {
+          if (content.trim().toLowerCase() === '/clear' && deps) {
             const targetGroup = getRegisteredGroup(chatJid);
             if (targetGroup) {
               try {
@@ -1052,7 +1149,7 @@ function safeBroadcast(
       continue;
     }
 
-    const session = getSessionWithUser(clientInfo.sessionId);
+    const session = getCachedSessionWithUser(clientInfo.sessionId);
     const expired = !!session && isSessionExpired(session.expires_at);
     const invalid =
       !session ||
@@ -1062,7 +1159,7 @@ function safeBroadcast(
       if (expired) {
         deleteUserSession(clientInfo.sessionId);
       }
-      lastActiveCache.delete(clientInfo.sessionId);
+      invalidateSessionCache(clientInfo.sessionId);
       wsClients.delete(client);
       try {
         client.close(1008, 'Unauthorized');
@@ -1248,6 +1345,166 @@ export function broadcastTyping(chatJid: string, isTyping: boolean): void {
   );
 }
 
+// ─── Streaming Snapshot Accumulation ─────────────────────────────────
+// Tracks current streaming state per group so WS reconnects can recover.
+
+interface StreamingSnapshotEntry {
+  partialText: string;
+  activeTools: Array<{
+    toolName: string;
+    toolUseId: string;
+    startTime: number;
+    toolInputSummary?: string;
+    parentToolUseId?: string | null;
+  }>;
+  recentEvents: Array<{
+    id: string;
+    timestamp: number;
+    text: string;
+    kind: 'tool' | 'skill' | 'hook' | 'status';
+  }>;
+  todos?: Array<{ id: string; content: string; status: string }>;
+  systemStatus: string | null;
+  turnId?: string;
+  updatedAt: number;
+}
+
+const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** Accumulates full (non-truncated) text per group for shutdown persistence & disk buffer. */
+const streamingFullTexts = new Map<string, string>();
+const MAX_SNAPSHOT_TEXT = 4000;
+const MAX_SNAPSHOT_EVENTS = 20;
+
+/** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
+function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' }): void {
+  snap.recentEvents.push(event);
+  if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
+    snap.recentEvents = snap.recentEvents.slice(-MAX_SNAPSHOT_EVENTS);
+  }
+}
+
+function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): void {
+  let snap = streamingSnapshots.get(normalizedJid);
+
+  // Reset on new turn
+  if (snap?.turnId && event.turnId && snap.turnId !== event.turnId) {
+    snap = undefined;
+    streamingFullTexts.delete(normalizedJid);
+  }
+
+  if (!snap) {
+    snap = {
+      partialText: '',
+      activeTools: [],
+      recentEvents: [],
+      systemStatus: null,
+      turnId: event.turnId,
+      updatedAt: Date.now(),
+    };
+  }
+
+  snap.updatedAt = Date.now();
+  if (event.turnId) snap.turnId = event.turnId;
+
+  switch (event.eventType) {
+    case 'text_delta':
+      if (event.text) {
+        snap.partialText += event.text;
+        if (snap.partialText.length > MAX_SNAPSHOT_TEXT) {
+          snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
+        }
+        // Accumulate full (non-truncated) text for shutdown persistence
+        streamingFullTexts.set(normalizedJid, (streamingFullTexts.get(normalizedJid) || '') + event.text);
+      }
+      break;
+
+    case 'tool_use_start':
+      if (event.toolUseId && event.toolName) {
+        snap.activeTools.push({
+          toolName: event.toolName,
+          toolUseId: event.toolUseId,
+          startTime: Date.now(),
+          toolInputSummary: event.toolInputSummary,
+          parentToolUseId: event.parentToolUseId,
+        });
+        pushRecentEvent(snap, {
+          id: event.toolUseId,
+          timestamp: Date.now(),
+          text: event.skillName || event.toolName,
+          kind: event.skillName ? 'skill' : 'tool',
+        });
+      }
+      break;
+
+    case 'tool_use_end':
+      if (event.toolUseId) {
+        snap.activeTools = snap.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+      }
+      break;
+
+    case 'tool_progress':
+      if (event.toolUseId) {
+        const tool = snap.activeTools.find(t => t.toolUseId === event.toolUseId);
+        if (tool) {
+          if (event.toolInputSummary) tool.toolInputSummary = event.toolInputSummary;
+        }
+      }
+      break;
+
+    case 'status':
+      snap.systemStatus = event.statusText || null;
+      if (event.statusText) {
+        pushRecentEvent(snap, {
+          id: `status-${Date.now()}`,
+          timestamp: Date.now(),
+          text: event.statusText,
+          kind: 'status',
+        });
+      }
+      break;
+
+    case 'hook_started':
+      if (event.hookName) {
+        pushRecentEvent(snap, {
+          id: `hook-${Date.now()}`,
+          timestamp: Date.now(),
+          text: `${event.hookName} (${event.hookEvent || ''})`,
+          kind: 'hook',
+        });
+      }
+      break;
+
+    case 'todo_update':
+      if (event.todos) {
+        snap.todos = event.todos.map(t => ({ id: t.id, content: t.content, status: t.status }));
+      }
+      break;
+  }
+
+  streamingSnapshots.set(normalizedJid, snap);
+}
+
+export function clearStreamingSnapshot(chatJid: string): void {
+  const jid = normalizeHomeJid(chatJid);
+  streamingSnapshots.delete(jid);
+  streamingFullTexts.delete(jid);
+}
+
+/**
+ * Return all active streaming texts with non-empty content.
+ * Uses the full (non-truncated) text accumulator for shutdown persistence & disk buffer.
+ */
+export function getActiveStreamingTexts(): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const [jid, fullText] of streamingFullTexts) {
+    const text = fullText.trim();
+    if (text) {
+      result.set(jid, text);
+    }
+  }
+  return result;
+}
+
 export function broadcastStreamEvent(
   chatJid: string,
   event: StreamEvent,
@@ -1259,6 +1516,11 @@ export function broadcastStreamEvent(
     ? { type: 'stream_event', chatJid: jid, event, agentId }
     : { type: 'stream_event', chatJid: jid, event };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+
+  // Accumulate snapshot for both main and agent streams.
+  // Agent streams use virtual JID format (jid#agent:agentId) as the key.
+  const snapshotJid = agentId ? `${jid}#agent:${agentId}` : jid;
+  updateStreamingSnapshot(snapshotJid, event);
 }
 
 export function broadcastBillingUpdate(
@@ -1313,6 +1575,18 @@ export function broadcastRunnerState(
     state,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+
+  // Clear streaming snapshots when runner goes idle (main + all agent snapshots)
+  if (state === 'idle') {
+    streamingSnapshots.delete(jid);
+    streamingFullTexts.delete(jid);
+    // Collect keys first, then delete (avoid mutating Map during iteration)
+    const agentPrefix = jid + '#agent:';
+    const snapshotKeysToDelete = [...streamingSnapshots.keys()].filter(k => k.startsWith(agentPrefix));
+    const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
+    for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
+    for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
+  }
 }
 
 export function broadcastDockerBuildLog(line: string): void {

@@ -46,14 +46,13 @@ export interface RegisteredGroup {
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
   is_home?: boolean; // 用户主容器标记
-  selected_skills?: string[] | null; // null = 全部启用
   target_agent_id?: string; // IM 消息路由到指定 conversation agent
   target_main_jid?: string; // IM 消息路由到指定工作区的主对话（web:{folder}）
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
-  mcp_mode?: 'inherit' | 'custom'; // MCP 模式：继承全局或自定义（默认 'inherit'）
-  selected_mcps?: string[] | null; // 自定义模式下选中的 MCP 列表（null = 使用全局全部）
+  mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
+  selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
 }
 
 export interface GroupMember {
@@ -74,7 +73,28 @@ export interface NewMessage {
   content: string;
   timestamp: string;
   attachments?: string;
+  turn_id?: string | null;
+  session_id?: string | null;
+  sdk_message_uuid?: string | null;
+  source_kind?: MessageSourceKind | null;
+  finalization_reason?: MessageFinalizationReason | null;
 }
+
+export type MessageSourceKind =
+  | 'sdk_final'
+  | 'sdk_send_message'
+  | 'interrupt_partial'
+  | 'overflow_partial'
+  | 'compact_partial'
+  | 'user_command'
+  | 'legacy';
+
+export type MessageFinalizationReason =
+  | 'completed'
+  | 'interrupted'
+  | 'error'
+  | 'shutdown'
+  | 'crash_recovery';
 
 export interface MessageAttachment {
   type: 'image';
@@ -103,6 +123,7 @@ export interface ScheduledTask {
   status: 'active' | 'paused' | 'completed';
   created_at: string;
   created_by?: string;
+  notify_channels?: string[] | null;
 }
 
 export interface TaskRunLog {
@@ -157,6 +178,7 @@ export interface User {
   notes: string | null;
   avatar_emoji: string | null;
   avatar_color: string | null;
+  avatar_url: string | null;
   ai_name: string | null;
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
@@ -181,6 +203,7 @@ export interface UserPublic {
   notes: string | null;
   avatar_emoji: string | null;
   avatar_color: string | null;
+  avatar_url: string | null;
   ai_name: string | null;
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
@@ -260,7 +283,7 @@ export interface AuthAuditLog {
 // --- Sub-Agent types ---
 
 export type AgentStatus = 'idle' | 'running' | 'completed' | 'error';
-export type AgentKind = 'task' | 'conversation';
+export type AgentKind = 'task' | 'conversation' | 'spawn';
 
 export interface SubAgent {
   id: string;
@@ -274,6 +297,9 @@ export interface SubAgent {
   created_at: string;
   completed_at: string | null;
   result_summary: string | null;
+  last_im_jid: string | null;
+  /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
+  spawned_from_jid: string | null;
 }
 
 // WebSocket message types
@@ -342,7 +368,30 @@ export type WsMessageOut =
       userId: string;
       usage: BillingAccessResult;
     }
-  | { type: 'ws_error'; error: string; chatJid?: string };
+  | { type: 'ws_error'; error: string; chatJid?: string }
+  | {
+      type: 'stream_snapshot';
+      chatJid: string;
+      snapshot: {
+        partialText: string;
+        activeTools: Array<{
+          toolName: string;
+          toolUseId: string;
+          startTime: number;
+          toolInputSummary?: string;
+          parentToolUseId?: string | null;
+        }>;
+        recentEvents: Array<{
+          id: string;
+          timestamp: number;
+          text: string;
+          kind: 'tool' | 'skill' | 'hook' | 'status';
+        }>;
+        todos?: Array<{ id: string; content: string; status: string }>;
+        systemStatus: string | null;
+        turnId?: string;
+      };
+    };
 
 export type WsMessageIn =
   | {

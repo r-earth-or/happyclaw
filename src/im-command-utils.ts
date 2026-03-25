@@ -63,6 +63,7 @@ export function formatWorkspaceList(
   workspaces: WorkspaceInfo[],
   currentFolder: string,
   currentAgentId: string | null,
+  currentOnMain = true,
 ): string {
   if (workspaces.length === 0) return '没有可用的工作区';
 
@@ -73,7 +74,7 @@ export function formatWorkspaceList(
     const marker = isCurrent ? ' ▶' : '';
     lines.push(`${marker} ${ws.name} (${ws.folder})`);
 
-    const mainMarker = isCurrent && !currentAgentId ? ' ← 当前' : '';
+    const mainMarker = isCurrent && currentOnMain ? ' ← 当前' : '';
     lines.push(`  · 主对话${mainMarker}`);
 
     for (const agent of ws.agents) {
@@ -86,7 +87,7 @@ export function formatWorkspaceList(
   }
 
   lines.push('');
-  lines.push('💡 使用 /recall 总结最近对话记录，/clear 重置上下文');
+  lines.push('💡 /sw <消息> 并行任务 · /recall 总结 · /clear 重置');
   return lines.join('\n');
 }
 
@@ -180,7 +181,7 @@ export function formatSystemStatus(
     `⚡ 状态: ${statusText}`,
     `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount}/${queueStatus.maxHostProcesses} 进程`,
     '',
-    '💡 /where 查看绑定 · /list 查看全部',
+    '💡 /sw <消息> 并行任务 · /where 绑定 · /list 全部',
   ];
 
   return lines.join('\n');

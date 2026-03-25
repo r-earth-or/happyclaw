@@ -1,6 +1,9 @@
 // Utility functions
 
-import { TRUST_PROXY } from './config.js';
+import fs from 'fs';
+import path from 'path';
+
+import { DATA_DIR, TRUST_PROXY } from './config.js';
 
 /**
  * Strip agent-internal XML tags from output text.
@@ -12,6 +15,17 @@ export function stripAgentInternalTags(text: string): string {
     .replace(/<internal>[\s\S]*?<\/internal>/g, '')
     .replace(/<process>[\s\S]*?<\/process>/g, '')
     .trim();
+}
+
+/**
+ * Strip virtual JID suffixes (#task:xxx, #agent:xxx) to get the base JID.
+ */
+export function stripVirtualJidSuffix(jid: string): string {
+  const taskSep = jid.indexOf('#task:');
+  if (taskSep >= 0) return jid.slice(0, taskSep);
+  const agentSep = jid.indexOf('#agent:');
+  if (agentSep >= 0) return jid.slice(0, agentSep);
+  return jid;
 }
 
 export function getClientIp(c: any): string {
@@ -31,4 +45,20 @@ export function getClientIp(c: any): string {
     c.env?.remoteAddr ||
     c.req.raw?.socket?.remoteAddress;
   return connInfo || 'unknown';
+}
+
+/** Create IPC + session directories for an agent. */
+export function ensureAgentDirectories(
+  folder: string,
+  agentId: string,
+): string {
+  const agentIpcDir = path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
+  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(
+    path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude'),
+    { recursive: true },
+  );
+  return agentIpcDir;
 }

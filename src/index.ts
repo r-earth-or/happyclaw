@@ -12,11 +12,13 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
-  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TIMEZONE,
+  isDockerAvailable,
+  updateWeChatNoProxy,
 } from './config.js';
+import { interruptibleSleep } from './message-notifier.js';
 import {
   AvailableGroup,
   ContainerInput,
@@ -30,6 +32,7 @@ import {
   closeDatabase,
   createTask,
   deleteExpiredSessions,
+  getExpiredSessionIds,
   deleteTask,
   ensureChatExists,
   ensureUserHomeGroup,
@@ -46,6 +49,8 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getRouterStateByPrefix,
+  deleteRouterState,
   getTaskById,
   getUserHomeGroup,
   initDatabase,
@@ -64,11 +69,14 @@ import {
   createAgent,
   getAgent,
   updateAgentStatus,
+  updateAgentLastImJid,
   updateAgentInfo,
-  deleteCompletedTaskAgents,
+  deleteCompletedAgents,
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
+  markStaleSpawnAgentsAsError,
+  listActiveConversationAgents,
   getSession,
   listAgentsByJid,
   getGroupsByOwner,
@@ -88,6 +96,7 @@ import {
   abortAllStreamingSessions,
   registerMessageIdMapping,
   getStreamingSession,
+  StreamingCardController,
 } from './feishu-streaming-card.js';
 import {
   formatContextMessages,
@@ -96,7 +105,7 @@ import {
   resolveLocationInfo,
   type WorkspaceInfo,
 } from './im-command-utils.js';
-import { analyzeIntent } from './intent-analyzer.js';
+import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import {
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
@@ -104,6 +113,7 @@ import {
   getUserFeishuConfig,
   getUserTelegramConfig,
   getUserQQConfig,
+  getUserWeChatConfig,
   getSystemSettings,
   saveUserFeishuConfig,
   saveUserTelegramConfig,
@@ -115,9 +125,10 @@ import type {
   FeishuConnectConfig,
   TelegramConnectConfig,
   QQConnectConfig,
+  WeChatConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
@@ -133,9 +144,15 @@ import {
   MessageCursor,
   NewMessage,
   RegisteredGroup,
+  StreamEvent,
+  SubAgent,
 } from './types.js';
 import { logger } from './logger.js';
-import { stripAgentInternalTags } from './utils.js';
+import {
+  ensureAgentDirectories,
+  stripAgentInternalTags,
+  stripVirtualJidSuffix,
+} from './utils.js';
 import { normalizeImageAttachments } from './message-attachments.js';
 import {
   startWebServer,
@@ -147,8 +164,10 @@ import {
   broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
+  getActiveStreamingTexts,
+  clearStreamingSnapshot,
 } from './web.js';
-import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
+import { installSkillForUser, deleteSkillForUser, syncHostSkillsForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
 import { executeSessionReset } from './commands.js';
 
@@ -157,14 +176,251 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_MAIN_JID = 'web:main';
 const DEFAULT_MAIN_NAME = 'Main';
 const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
+const OOM_EXIT_RE = /code 137/;
+
+/**
+ * Feed a stream event into a Feishu streaming card controller.
+ * Centralizes the event → card mapping for both main and sub-agent handlers.
+ */
+function feedStreamEventToCard(
+  session: StreamingCardController,
+  se: StreamEvent,
+  accumulatedText: string,
+): void {
+  switch (se.eventType) {
+    case 'text_delta':
+      if (se.text) session.append(accumulatedText);
+      break;
+    case 'thinking_delta':
+      if (se.text) {
+        session.appendThinking(se.text);
+      } else if (!accumulatedText) {
+        // Only call setThinking() when no text was appended
+        // (appendThinking already sets thinking=true and triggers card creation)
+        session.setThinking();
+      }
+      break;
+    case 'tool_use_start':
+      if (se.toolUseId && se.toolName) {
+        session.startTool(se.toolUseId, se.toolName);
+        const label = se.skillName ? `技能 ${se.skillName}` : se.toolName;
+        session.pushRecentEvent(`🔄 ${label}`);
+      }
+      break;
+    case 'tool_use_end':
+      if (se.toolUseId) {
+        const info = session.getToolInfo(se.toolUseId);
+        session.endTool(se.toolUseId, false);
+        if (info) session.pushRecentEvent(`✅ ${info.name}`);
+      }
+      break;
+    case 'tool_progress':
+      if (se.toolUseId && se.toolInputSummary) {
+        session.updateToolSummary(se.toolUseId, se.toolInputSummary);
+      }
+      break;
+    case 'status':
+      if (se.statusText && se.statusText !== 'interrupted') {
+        session.setSystemStatus(se.statusText);
+      }
+      break;
+    case 'hook_started':
+      session.setHook({ hookName: se.hookName || '', hookEvent: se.hookEvent || '' });
+      break;
+    case 'hook_response':
+      if (se.hookName) {
+        session.pushRecentEvent(`✅ Hook: ${se.hookName}`);
+      }
+      session.setHook(null);
+      break;
+    case 'todo_update':
+      if (se.todos) session.setTodos(se.todos);
+      break;
+    case 'task_start':
+      if (se.toolUseId) {
+        const label = se.taskDescription ? `Task: ${se.taskDescription.slice(0, 40)}` : 'Task';
+        session.startTool(se.toolUseId, label);
+        session.pushRecentEvent(`🚀 ${label}`);
+      }
+      break;
+    case 'task_notification':
+      if (se.toolUseId || se.taskId) {
+        const id = se.toolUseId || se.taskId || '';
+        session.endTool(id, false);
+        const label = se.taskSummary ? `Task: ${se.taskSummary.slice(0, 40)}` : 'Task 完成';
+        session.pushRecentEvent(`✅ ${label}`);
+      }
+      break;
+    case 'hook_progress':
+      // Update hook state (no card push needed — card already shows hook indicator)
+      session.setHook({ hookName: se.hookName || '', hookEvent: se.hookEvent || '' });
+      break;
+    case 'usage':
+      if (se.usage) session.patchUsageNote(se.usage);
+      break;
+    case 'init':
+      // Internal signal, no card display needed
+      break;
+  }
+}
 
 let globalMessageCursor: MessageCursor = { timestamp: '', id: '' };
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, MessageCursor> = {};
+// Recovery-safe cursor: only advances when an agent actually finishes processing.
+// recoverPendingMessages() uses this to detect IPC-injected but unprocessed messages.
+let lastCommittedCursor: Record<string, MessageCursor> = {};
+
+/** Set both cursors directly (no max-merge) and persist. */
+function setCursors(jid: string, cursor: MessageCursor): void {
+  lastAgentTimestamp[jid] = cursor;
+  lastCommittedCursor[jid] = cursor;
+  saveState();
+}
+
+/** Advance cursors to `candidate`, never regressing behind existing position. */
+function advanceCursors(jid: string, candidate: MessageCursor): void {
+  const current = lastAgentTimestamp[jid];
+  const target = current && current.timestamp > candidate.timestamp ? current : candidate;
+  lastAgentTimestamp[jid] = target;
+  lastCommittedCursor[jid] = target;
+  saveState();
+}
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
+
+// ── IPC Watcher Manager (event-driven fs.watch + fallback polling) ──
+
+class IpcWatcherManager {
+  private watchers = new Map<string, { watchers: fs.FSWatcher[], refCount: number }>();
+  private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private processingFolders = new Set<string>();
+  private pendingReprocess = new Set<string>();
+  private fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  private processGroupFn: ((folder: string) => Promise<void>) | null = null;
+  private processFullFn: (() => Promise<void>) | null = null;
+
+  /** Bind the per-group and full-scan processing functions (set once from startIpcWatcher). */
+  bind(
+    processGroup: (folder: string) => Promise<void>,
+    processFull: () => Promise<void>,
+  ): void {
+    this.processGroupFn = processGroup;
+    this.processFullFn = processFull;
+  }
+
+  /** Start watching a group's IPC directories. Called when a container/process starts. */
+  watchGroup(folder: string): void {
+    const existing = this.watchers.get(folder);
+    if (existing) {
+      existing.refCount++;
+      return;
+    }
+
+    const groupIpcRoot = path.join(DATA_DIR, 'ipc', folder);
+    const dirsToWatch = [
+      path.join(groupIpcRoot, 'messages'),
+      path.join(groupIpcRoot, 'tasks'),
+    ];
+
+    const folderWatchers: fs.FSWatcher[] = [];
+    for (const dir of dirsToWatch) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        // Listen to all event types — 'rename' covers atomic writes on Linux,
+        // but Docker bind mounts (macOS virtiofs) may emit 'change' instead.
+        const w = fs.watch(dir, () => {
+          this.debouncedProcess(folder);
+        });
+        w.on('error', () => {
+          // Watcher error — fallback polling will handle it
+        });
+        folderWatchers.push(w);
+      } catch {
+        // Watch failed — fallback polling will handle it
+      }
+    }
+    this.watchers.set(folder, { watchers: folderWatchers, refCount: 1 });
+  }
+
+  /** Stop watching a group's IPC directories. Called when a container/process stops. */
+  unwatchGroup(folder: string): void {
+    const entry = this.watchers.get(folder);
+    if (!entry) return;
+    entry.refCount--;
+    if (entry.refCount > 0) return;
+
+    for (const w of entry.watchers) { try { w.close(); } catch {} }
+    this.watchers.delete(folder);
+    const timer = this.debounceTimers.get(folder);
+    if (timer) {
+      clearTimeout(timer);
+      this.debounceTimers.delete(folder);
+    }
+  }
+
+  private debouncedProcess(folder: string): void {
+    const existing = this.debounceTimers.get(folder);
+    if (existing) clearTimeout(existing);
+    this.debounceTimers.set(folder, setTimeout(() => {
+      this.debounceTimers.delete(folder);
+      // Skip if a previous processGroupIpc call for this folder is still running;
+      // the pending flag ensures we re-process after the current run finishes.
+      if (this.processingFolders.has(folder)) {
+        this.pendingReprocess.add(folder);
+        return;
+      }
+      this.processingFolders.add(folder);
+      this.processGroupFn?.(folder)
+        .catch((err) => { logger.error({ err, folder }, 'Error processing IPC for group'); })
+        .finally(() => {
+          this.processingFolders.delete(folder);
+          // Files may have arrived during processing — run once more
+          if (this.pendingReprocess.delete(folder) && this.watchers.has(folder)) {
+            this.debouncedProcess(folder);
+          }
+        });
+    }, 100));
+  }
+
+  /** Trigger processing for a folder through the concurrency guard. */
+  triggerProcess(folder: string): void {
+    this.debouncedProcess(folder);
+  }
+
+  /** Start fallback polling (every 5s) as safety net for inotify failures. */
+  startFallback(): void {
+    this.fallbackTimer = setInterval(() => {
+      if (shuttingDown) return;
+      this.processFullFn?.().catch((err) => {
+        logger.error({ err }, 'Error in IPC fallback scan');
+      });
+    }, 5000);
+    this.fallbackTimer.unref(); // Don't prevent process from naturally exiting
+  }
+
+  /** Close all watchers and timers. */
+  closeAll(): void {
+    for (const [, entry] of this.watchers) {
+      for (const w of entry.watchers) { try { w.close(); } catch {} }
+    }
+    this.watchers.clear();
+    for (const [, timer] of this.debounceTimers) {
+      clearTimeout(timer);
+    }
+    this.debounceTimers.clear();
+    if (this.fallbackTimer) {
+      clearInterval(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+  }
+}
+
+let ipcWatcherManager: IpcWatcherManager | null = null;
+/** JIDs already persisted by the shutdown handler — prevents finally blocks from duplicating. */
+const shutdownSavedJids = new Set<string>();
 
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
@@ -173,15 +429,30 @@ const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 6 * 60 * 1000;
 let stuckRunnerCheckCounter = 0;
 
+// OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
+// After OOM_AUTO_RESET_THRESHOLD consecutive OOMs, auto-clear the session.
+const consecutiveOomExits: Record<string, number> = {};
+const OOM_AUTO_RESET_THRESHOLD = 2;
+
 // Per-folder reply route updater: lets sendMessage callers update the
 // reply routing of a running processGroupMessages without killing the process.
 // Key is group folder (one active processGroupMessages per folder).
 type ReplyRouteUpdater = (newSourceJid: string | null) => void;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 
+// Per-folder IM reply route: tracks the current replySourceImJid for each
+// running processGroupMessages.  IPC watcher reads this to forward send_message
+// outputs to the correct IM channel (the running session holds the truth).
+const activeImReplyRoutes = new Map<string, string | null>();
+
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
 const IM_SEND_FAIL_THRESHOLD = 3;
+
+// Groups whose pending messages were recovered after a restart.
+// processGroupMessages injects recent conversation history for these groups
+// so the fresh session has context despite the session being cleared.
+const recoveryGroups = new Set<string>();
 
 // Track consecutive IM health check failures per JID for safe auto-unbind
 const imHealthCheckFailCounts = new Map<string, number>();
@@ -404,31 +675,72 @@ function extractLocalImImagePaths(
   return imagePaths;
 }
 
+/**
+ * Generic IM operation retry with linear backoff (2s, 4s, 6s).
+ * Returns true on success, false when all retries are exhausted.
+ */
+const IM_SEND_MAX_RETRIES = 3;
+const IM_SEND_RETRY_DELAY_MS = 2_000;
+
+async function retryImOperation(
+  label: string,
+  imJid: string,
+  fn: () => Promise<void>,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
+    try {
+      await fn();
+      return true;
+    } catch (err) {
+      logger.warn({ imJid, attempt, label, err }, 'IM operation attempt failed');
+      if (attempt < IM_SEND_MAX_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)));
+      }
+    }
+  }
+  logger.error({ imJid, label }, 'IM operation failed after all retries');
+  return false;
+}
+
+/**
+ * Send an IM message with retry.
+ * On final failure, increments imSendFailCounts and may auto-unbind the IM group.
+ */
+async function sendImWithRetry(
+  imJid: string,
+  text: string,
+  localImagePaths: string[],
+): Promise<boolean> {
+  const ok = await retryImOperation('send_message', imJid, () =>
+    imManager.sendMessage(imJid, text, localImagePaths),
+  );
+  if (ok) {
+    imSendFailCounts.delete(imJid);
+    return true;
+  }
+  // All retries exhausted — track cumulative failures
+  const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
+  imSendFailCounts.set(imJid, count);
+  if (count >= IM_SEND_FAIL_THRESHOLD) {
+    try {
+      unbindImGroup(
+        imJid,
+        'Auto-unbound IM group after consecutive send failures',
+      );
+    } catch (unbindErr) {
+      logger.error({ imJid, unbindErr }, 'Failed to auto-unbind IM group');
+    }
+  }
+  return false;
+}
+
+/** Fire-and-forget wrapper for sendImWithRetry (used in non-await contexts). */
 function sendImWithFailTracking(
   imJid: string,
   text: string,
   localImagePaths: string[],
 ): void {
-  imManager
-    .sendMessage(imJid, text, localImagePaths)
-    .then(() => {
-      imSendFailCounts.delete(imJid);
-    })
-    .catch((err) => {
-      logger.warn({ imJid, err }, 'Failed to relay message to IM');
-      const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
-      imSendFailCounts.set(imJid, count);
-      if (count >= IM_SEND_FAIL_THRESHOLD) {
-        try {
-          unbindImGroup(
-            imJid,
-            'Auto-unbound IM group after consecutive send failures',
-          );
-        } catch (unbindErr) {
-          logger.error({ imJid, unbindErr }, 'Failed to auto-unbind IM group');
-        }
-      }
-    });
+  sendImWithRetry(imJid, text, localImagePaths).catch(() => {});
 }
 
 function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
@@ -562,8 +874,8 @@ async function handleCommand(
   command: string,
 ): Promise<string | null> {
   const parts = command.split(/\s+/);
-  const cmd = parts[0];
-  const rawArgs = command.slice(cmd.length).trim();
+  const cmd = parts[0].toLowerCase();
+  const rawArgs = command.slice(parts[0].length).trim();
 
   switch (cmd) {
     case 'clear':
@@ -586,6 +898,9 @@ async function handleCommand(
       return handleNewCommand(chatJid, rawArgs);
     case 'require_mention':
       return handleRequireMentionCommand(chatJid, rawArgs);
+    case 'sw':
+    case 'spawn':
+      return handleSpawnCommand(chatJid, rawArgs, chatJid);
     default:
       return null;
   }
@@ -595,26 +910,22 @@ async function handleClearCommand(chatJid: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前工作区';
 
-  // Only agent-bound IM groups support /clear (clears that agent's context).
-  // Main-conversation-bound groups (target_main_jid) should be cleared from Web.
-  if (group.target_main_jid && !group.target_agent_id) {
-    return '当前群组未绑定子对话，请在 Web 端清除上下文';
-  }
-
   const agentId = group.target_agent_id || undefined;
+  // IM 群绑定工作区主对话时，使用工作区 JID 清除上下文，
+  // 确保 divider 插入到工作区消息流（Web 端可见）。
+  const effectiveJid = (group.target_main_jid && !agentId)
+    ? group.target_main_jid
+    : chatJid;
 
   try {
     await executeSessionReset(
-      chatJid,
+      effectiveJid,
       group.folder,
       {
         queue,
         sessions,
         broadcast: broadcastNewMessage,
-        setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
-          lastAgentTimestamp[jid] = cursor;
-          saveState();
-        },
+        setLastAgentTimestamp: setCursors,
       },
       agentId,
     );
@@ -763,9 +1074,25 @@ function handleListCommand(chatJid: string): string {
   const workspaces = collectWorkspaces(userId);
   if (workspaces.length === 0) return '没有可用的工作区';
 
+  const lookupGroup = (jid: string) =>
+    registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(
+    group,
+    lookupGroup,
+    getAgent,
+    findGroupNameByFolder,
+  );
+
+  const currentAgentId = group.target_agent_id ?? null;
+  const currentOnMain = !currentAgentId;
+
   return (
-    formatWorkspaceList(workspaces, group.folder, null) +
-    '\n💡 使用 /bind <workspace> 或 /bind <workspace>/<agent短ID>'
+    formatWorkspaceList(
+      workspaces,
+      location.folder,
+      currentAgentId,
+      currentOnMain,
+    ) + '\n💡 使用 /bind <workspace> 或 /bind <workspace>/<agent短ID>'
   );
 }
 
@@ -866,7 +1193,7 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
   return `已切换到 ${resolved.display}\n🔁 回复策略: source_only`;
 }
 
-function handleNewCommand(chatJid: string, rawName: string): string {
+async function handleNewCommand(chatJid: string, rawName: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
   const userId = group.created_by;
@@ -885,7 +1212,7 @@ function handleNewCommand(chatJid: string, rawName: string): string {
     name,
     folder,
     added_at: now,
-    executionMode: 'container',
+    executionMode: (await isDockerAvailable()) ? 'container' : 'host',
     created_by: userId,
   };
 
@@ -1094,6 +1421,175 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
   });
 }
 
+// ─── /sw & /spawn: parallel task spawning ────────────────────────
+
+interface SpawnWorkspace {
+  homeChatJid: string;
+  homeGroup: RegisteredGroup;
+  effectiveGroup: RegisteredGroup;
+}
+
+/**
+ * Resolve the workspace for a /spawn command.
+ * Returns a SpawnWorkspace on success, or an error message string on failure.
+ */
+function resolveSpawnWorkspace(
+  baseJid: string,
+  group: RegisteredGroup,
+  userId: string,
+): SpawnWorkspace | string {
+  let homeChatJid: string;
+  let homeGroup: RegisteredGroup;
+
+  if (group.target_main_jid) {
+    const target =
+      registeredGroups[group.target_main_jid] ??
+      getRegisteredGroup(group.target_main_jid);
+    if (!target) return '绑定的工作区不存在';
+    homeChatJid = group.target_main_jid;
+    homeGroup = target;
+  } else if (group.target_agent_id) {
+    const agentInfo = getAgent(group.target_agent_id);
+    if (!agentInfo) return '绑定的 Agent 不存在';
+    const parent =
+      registeredGroups[agentInfo.chat_jid] ??
+      getRegisteredGroup(agentInfo.chat_jid);
+    if (!parent) return '绑定 Agent 所属的工作区不存在';
+    homeChatJid = agentInfo.chat_jid;
+    homeGroup = parent;
+  } else if (baseJid.startsWith('web:')) {
+    homeChatJid = baseJid;
+    homeGroup = group;
+  } else {
+    // IM group not bound — use the user's home workspace
+    const userHome = getUserHomeGroup(userId);
+    if (!userHome) return '未找到用户主工作区';
+    homeChatJid = `web:${userHome.folder}`;
+    // Lookup the RegisteredGroup object — prefer the web: JID, fall back to any JID for this folder
+    const homeJids = getJidsByFolder(userHome.folder);
+    const webJid = homeJids.find((j) => j.startsWith('web:')) ?? homeJids[0];
+    const resolvedHome = webJid
+      ? (registeredGroups[webJid] ?? getRegisteredGroup(webJid))
+      : undefined;
+    if (!resolvedHome) return '未找到用户主工作区';
+    homeGroup = resolvedHome;
+  }
+
+  const { effectiveGroup } = resolveEffectiveGroup(homeGroup);
+  return { homeChatJid, homeGroup, effectiveGroup };
+}
+
+async function handleSpawnCommand(
+  chatJid: string,
+  rawMessage: string,
+  sourceImJid?: string,
+): Promise<string> {
+  const message = rawMessage.trim();
+  if (!message) return '用法: /sw <任务描述>\n在当前工作区创建并行任务';
+
+  const baseJid = stripVirtualJidSuffix(chatJid);
+  const group = registeredGroups[baseJid] ?? getRegisteredGroup(baseJid);
+  if (!group) return '未找到当前工作区';
+  const userId = group.created_by;
+  if (!userId) return '无法确定当前聊天所属用户';
+
+  const resolved = resolveSpawnWorkspace(baseJid, group, userId);
+  if (typeof resolved === 'string') return resolved;
+  const { homeChatJid, effectiveGroup } = resolved;
+
+  // 3. Determine the spawned_from_jid (where to inject results back)
+  //    For IM: resolve to the effective web JID so results enter the web message stream
+  //    For Web: use the chatJid directly (may include #agent: for agent-scoped spawn)
+  const spawnedFromJid = sourceImJid ? homeChatJid : chatJid;
+
+  const now = new Date().toISOString();
+  const agentId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const user = getUserById(userId);
+  const senderName = user?.display_name || user?.username || userId;
+  const truncatedName = message.length > 30
+    ? message.slice(0, 30) + '…'
+    : message;
+  const agentName = `⚡ ${truncatedName}`;
+
+  // Create agent record
+  const newAgent: SubAgent = {
+    id: agentId,
+    group_folder: effectiveGroup.folder,
+    chat_jid: homeChatJid,
+    name: agentName,
+    prompt: '',
+    status: 'idle',
+    kind: 'spawn',
+    created_by: userId,
+    created_at: now,
+    completed_at: null,
+    result_summary: null,
+    last_im_jid: sourceImJid ?? null,
+    spawned_from_jid: spawnedFromJid,
+  };
+  createAgent(newAgent);
+
+  // Create IPC + session directories
+  ensureAgentDirectories(effectiveGroup.folder, agentId);
+
+  // Create virtual chat + store user's message in it
+  const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+  ensureChatExists(virtualChatJid);
+  updateChatName(virtualChatJid, agentName);
+  storeMessageDirect(
+    messageId,
+    virtualChatJid,
+    userId,
+    senderName,
+    message,
+    now,
+    false,
+    sourceImJid ? { sourceJid: sourceImJid } : undefined,
+  );
+  broadcastNewMessage(virtualChatJid, {
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: senderName,
+    content: message,
+    timestamp: now,
+    is_from_me: false,
+  });
+
+  broadcastAgentStatus(homeChatJid, agentId, 'idle', agentName, '', undefined, 'spawn');
+
+  // For IM-originated /sw, mirror the command into homeChatJid so Web chat
+  // shows what was requested. Web path handles this in web.ts instead.
+  if (sourceImJid) {
+    ensureChatExists(homeChatJid);
+    // source_kind='user_command' prevents the polling loop from picking it up.
+    const cmdId = crypto.randomUUID();
+    storeMessageDirect(cmdId, homeChatJid, userId, senderName, `/sw ${message}`, now, false, {
+      meta: { sourceKind: 'user_command' },
+    });
+    broadcastNewMessage(homeChatJid, {
+      id: cmdId, chat_jid: homeChatJid,
+      sender: userId, sender_name: senderName,
+      content: `/sw ${message}`, timestamp: now, is_from_me: false,
+    });
+  }
+
+  // Enqueue task to start the agent
+  const taskId = `spawn:${agentId}:${Date.now()}`;
+  queue.enqueueTask(virtualChatJid, taskId, async () => {
+    await processAgentConversation(homeChatJid, agentId);
+  });
+
+  logger.info(
+    { chatJid, homeChatJid, agentId, userId, sourceImJid, folder: effectiveGroup.folder },
+    '/spawn command: agent created and enqueued',
+  );
+
+  const shortId = agentId.slice(0, 4);
+  return `⚡ 并行任务已启动 [${shortId}]: ${truncatedName}`;
+}
+
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   // Skip Feishu Reaction when a streaming card is active — the card itself
   // serves as a live typing indicator.
@@ -1112,6 +1608,14 @@ interface SendMessageOptions {
   localImagePaths?: string[];
   /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
   source?: string;
+  /** Metadata used to preserve Claude SDK turn semantics for persisted messages. */
+  messageMeta?: {
+    turnId?: string;
+    sessionId?: string;
+    sdkMessageUuid?: string;
+    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy';
+    finalizationReason?: 'completed' | 'interrupted' | 'error';
+  };
 }
 
 /**
@@ -1199,22 +1703,52 @@ function loadState(): void {
     timestamp: persistedTimestamp,
     id: lastTimestampId,
   };
-  const agentTs = getRouterState('last_agent_timestamp');
-  try {
-    const parsed = agentTs
-      ? (JSON.parse(agentTs) as Record<string, unknown>)
-      : {};
-    const normalized: Record<string, MessageCursor> = {};
-    for (const [jid, raw] of Object.entries(parsed)) {
-      normalized[jid] = normalizeCursor(raw);
+  const loadCursorMap = (key: string): Record<string, MessageCursor> => {
+    const raw = getRouterState(key);
+    try {
+      const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      const normalized: Record<string, MessageCursor> = {};
+      for (const [jid, v] of Object.entries(parsed)) {
+        normalized[jid] = normalizeCursor(v);
+      }
+      return normalized;
+    } catch {
+      logger.warn(`Corrupted ${key} in DB, resetting`);
+      return {};
     }
-    lastAgentTimestamp = normalized;
-  } catch {
-    logger.warn('Corrupted last_agent_timestamp in DB, resetting');
-    lastAgentTimestamp = {};
+  };
+  lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
+  lastCommittedCursor = loadCursorMap('last_committed_cursor');
+
+  // Migration: fill in missing lastCommittedCursor entries from lastAgentTimestamp.
+  // The original migration only triggered when lastCommittedCursor was completely empty,
+  // missing the case where some keys exist but others don't (e.g. new IM groups).
+  {
+    let migrated = false;
+    for (const [jid, cursor] of Object.entries(lastAgentTimestamp)) {
+      if (!lastCommittedCursor[jid]) {
+        lastCommittedCursor[jid] = cursor;
+        migrated = true;
+      }
+    }
+    if (migrated) {
+      logger.info('Migrated missing lastCommittedCursor entries from lastAgentTimestamp');
+      saveState();
+    }
   }
+
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+
+  // Restore persisted OOM counters
+  for (const { key, value } of getRouterStateByPrefix('oom_exits:')) {
+    const folder = key.slice('oom_exits:'.length);
+    const count = parseInt(value, 10);
+    if (count > 0) {
+      consecutiveOomExits[folder] = count;
+      logger.info({ folder, count }, 'Restored OOM counter from DB');
+    }
+  }
 
   // Auto-register default groups from config/default-groups.json
   const defaultGroupsPath = path.resolve(
@@ -1364,6 +1898,7 @@ function saveState(): void {
   setRouterState('last_timestamp', globalMessageCursor.timestamp);
   setRouterState('last_timestamp_id', globalMessageCursor.id);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+  setRouterState('last_committed_cursor', JSON.stringify(lastCommittedCursor));
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -1557,9 +2092,47 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // chatJid is an IM channel — reply directly
     replySourceImJid = chatJid;
   }
+  // Publish the current IM reply route so the IPC watcher can forward
+  // send_message outputs to the correct IM channel.
+  activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
   const shared = isGroupShared(group.folder);
-  const prompt = formatMessages(missedMessages, shared);
+  let prompt = formatMessages(missedMessages, shared);
+
+  // Recovery mode: session was cleared to prevent session ghost, so inject
+  // recent conversation history to give the fresh session context.
+  const isRecovery = recoveryGroups.delete(chatJid);
+  if (isRecovery) {
+    const RECOVERY_HISTORY_LIMIT = 20;
+    const recentHistory = getMessagesPage(chatJid, undefined, RECOVERY_HISTORY_LIMIT);
+    // getMessagesPage returns DESC order; reverse to chronological, exclude
+    // the pending messages themselves (already in prompt).
+    const pendingIds = new Set(missedMessages.map((m) => m.id));
+    const historyMsgs = recentHistory
+      .reverse()
+      .filter((m) => !pendingIds.has(m.id));
+    if (historyMsgs.length > 0) {
+      const historyLines = historyMsgs.map((m) => {
+        const role = m.is_from_me ? 'assistant' : m.sender_name;
+        const truncated = m.content.length > 500
+          ? m.content.slice(0, 500) + '…'
+          : m.content;
+        // Strip lone surrogates to avoid API JSON errors
+        const cleaned = truncated.replace(/[\uD800-\uDFFF]/g, '');
+        return `[${role}] ${cleaned}`;
+      });
+      prompt =
+        '<system_context>\n' +
+        '服务刚重启，当前为新会话。以下是重启前的最近对话记录，供你了解上下文：\n\n' +
+        historyLines.join('\n') +
+        '\n</system_context>\n\n' +
+        prompt;
+      logger.info(
+        { group: group.name, historyCount: historyMsgs.length },
+        'Recovery: injected recent conversation history into prompt',
+      );
+    }
+  }
 
   const images = collectMessageImages(chatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
@@ -1571,6 +2144,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       directImReply,
       imageCount: images.length,
       shared,
+      isRecovery,
     },
     'Processing messages',
   );
@@ -1595,6 +2169,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastError = '';
   let cursorCommitted = false;
   let lastReplyMsgId: string | undefined;
+  let lastSavedTurnId: string | undefined;  // tracks last turnId saved to DB, prevents UPSERT overwrite
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
 
@@ -1607,6 +2182,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSession =
     imManager.createStreamingSession(streamingSessionJid, makeOnCardCreated(streamingSessionJid));
   let streamingAccumulatedText = '';
+  let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
@@ -1620,15 +2196,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   activeRouteUpdaters.set(effectiveGroup.folder, (newSourceJid) => {
     const newImJid =
       newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+    // New IPC user message arrived — reset sentReply so the next result
+    // can be delivered to IM. This is the correct place to reset, NOT
+    // in the streaming session rebuild (which also fires on SDK Task
+    // completion and would cause multi-result IM spam).
+    sentReply = false;
     if (newImJid === replySourceImJid) return; // no change
     logger.debug(
       { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
       'Reply route updated via IPC injection',
     );
     replySourceImJid = newImJid;
+    activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
-    // Rebuild streaming session if the target channel changed
-    const newStreamingJid = replySourceImJid ?? chatJid;
+    // Rebuild streaming session if the target channel changed.
+    // When the route is cleared to null (web message injected into IM-originated
+    // session), fall back to the web JID — NOT the original IM chatJid — so the
+    // Feishu streaming card is properly disposed.
+    const newStreamingJid = replySourceImJid ?? (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
     if (newStreamingJid !== streamingSessionJid) {
       if (streamingSession) {
         if (streamingSession.isActive()) streamingSession.dispose();
@@ -1637,6 +2222,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       streamingSessionJid = newStreamingJid;
       streamingSession = imManager.createStreamingSession(streamingSessionJid, makeOnCardCreated(streamingSessionJid));
       streamingAccumulatedText = '';
+      streamingAccumulatedThinking = '';
       if (streamingSession) {
         registerStreamingSession(streamingSessionJid, streamingSession);
       }
@@ -1665,11 +2251,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const commitCursor = (): void => {
     if (cursorCommitted) return;
-    lastAgentTimestamp[chatJid] = {
-      timestamp: lastProcessed.timestamp,
-      id: lastProcessed.id,
-    };
-    saveState();
+    advanceCursors(chatJid, { timestamp: lastProcessed.timestamp, id: lastProcessed.id });
     cursorCommitted = true;
   };
 
@@ -1700,47 +2282,53 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   let output: { status: 'success' | 'error' | 'closed'; error?: string } | undefined;
+  let activeSessionId = getSession(effectiveGroup.folder) || undefined;
   try {
   output = await runAgent(
     effectiveGroup,
     prompt,
     chatJid,
+    lastProcessed.id,
     async (result) => {
       try {
+        if (result.newSessionId && result.status !== 'error') {
+          activeSessionId = result.newSessionId;
+        }
         // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
 
-          // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+          // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
           if (result.streamEvent.eventType === 'text_delta' && result.streamEvent.text) {
             streamingAccumulatedText += result.streamEvent.text;
           }
+          if (result.streamEvent.eventType === 'thinking_delta' && result.streamEvent.text) {
+            streamingAccumulatedThinking += result.streamEvent.text;
+          }
 
           // ── Feed stream events into Feishu streaming card ──
-          if (streamingSession) {
-            const se = result.streamEvent;
-            switch (se.eventType) {
-              case 'text_delta':
-                if (se.text) {
-                  streamingSession.append(streamingAccumulatedText);
-                }
-                break;
-              case 'thinking_delta':
-                if (!streamingAccumulatedText) {
-                  streamingSession.setThinking();
-                }
-                break;
-              case 'tool_use_start':
-                if (se.toolUseId && se.toolName) {
-                  streamingSession.startTool(se.toolUseId, se.toolName);
-                }
-                break;
-              case 'tool_use_end':
-                if (se.toolUseId) {
-                  streamingSession.endTool(se.toolUseId, false);
-                }
-                break;
+          // IPC 注入的新 query 开始时，旧卡片已 complete()/abort()，
+          // 需要为新 query 重建流式卡片并重置会话级状态。
+          if (streamingSession && !streamingSession.isActive()) {
+            unregisterStreamingSession(streamingSessionJid);
+            streamingAccumulatedText = '';
+            streamingAccumulatedThinking = '';
+            // Note: sentReply is NOT reset here. Resetting it would cause
+            // subsequent SDK Task results to be sent to IM as separate messages,
+            // spamming the IM channel. The first substantive reply already
+            // delivered the main content; follow-up results are DB-only.
+            streamInterrupted = false;
+            streamingSession = imManager.createStreamingSession(
+              streamingSessionJid,
+              makeOnCardCreated(streamingSessionJid),
+            );
+            if (streamingSession) {
+              registerStreamingSession(streamingSessionJid, streamingSession);
+              logger.debug({ chatJid }, 'Rebuilt streaming card for IPC-injected query');
             }
+          }
+          if (streamingSession) {
+            feedStreamEventToCard(streamingSession, result.streamEvent, streamingAccumulatedText);
           }
 
           // ── 中断时立即保存已输出内容 ──
@@ -1751,14 +2339,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             result.streamEvent.statusText === 'interrupted'
           ) {
             streamInterrupted = true;
-            if (!sentReply) {
-              const interruptedText = buildInterruptedReply(streamingAccumulatedText);
+            // Skip if shutdown handler already saved this text (prevents duplicates)
+            const inlineWebJid = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+            const inlineAlreadySaved = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(inlineWebJid);
+            if (!sentReply && !inlineAlreadySaved) {
+              const interruptedText = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
               try {
                 if (streamingSession?.isActive()) {
                   await streamingSession.abort('已中断').catch(() => {});
                 }
-                lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
+                lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
+                  sendToIM: false,
+                  messageMeta: {
+                    turnId: result.streamEvent.turnId || lastProcessed.id,
+                    sessionId: result.streamEvent.sessionId || activeSessionId,
+                    sourceKind: 'interrupt_partial',
+                    finalizationReason: 'interrupted',
+                  },
+                });
                 sentReply = true;
+                clearStreamingSnapshot(chatJid);
+                streamingAccumulatedText = '';
+                streamingAccumulatedThinking = '';
                 commitCursor();
               } catch (err) {
                 logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
@@ -1793,6 +2395,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   created_at: new Date().toISOString(),
                   completed_at: null,
                   result_summary: null,
+                  last_im_jid: null,
+                  spawned_from_jid: null,
                 });
               } else if (se.taskDescription) {
                 updateAgentInfo(
@@ -1852,17 +2456,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               let targetTaskId = se.taskId;
               let existing = getAgent(targetTaskId);
               if (!existing || existing.kind !== 'task') {
+                // agent-runner now translates SDK task_id → toolUseId,
+                // so this fallback should rarely trigger. Keep as safety net.
                 const fallbackTaskId = pickRunningTaskForNotification();
                 if (fallbackTaskId) {
                   targetTaskId = fallbackTaskId;
                   existing = getAgent(fallbackTaskId);
-                  logger.warn(
+                  logger.debug(
                     {
                       chatJid,
                       sdkTaskId: se.taskId,
                       mappedTaskId: fallbackTaskId,
                     },
-                    'Task notification ID mismatch, mapped to running task',
+                    'Task notification ID fallback to running task',
                   );
                 }
               }
@@ -1880,6 +2486,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   created_at: new Date().toISOString(),
                   completed_at: new Date().toISOString(),
                   result_summary: summary || null,
+                  last_im_jid: null,
+                  spawned_from_jid: null,
                 });
                 broadcastAgentStatus(
                   chatJid,
@@ -1980,6 +2588,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
 
+          // Reset idle timer on stream events so long-running tool calls
+          // (e.g. MCP batch writes) don't get killed while the agent is
+          // actively working. Previously only final results triggered a reset.
+          resetIdleTimer();
           return;
         }
 
@@ -1989,7 +2601,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             typeof result.result === 'string'
               ? result.result
               : JSON.stringify(result.result);
-          const text = stripAgentInternalTags(raw);
+          let text = stripAgentInternalTags(raw);
+          if (result.sourceKind === 'overflow_partial' || result.sourceKind === 'compact_partial') {
+            text = buildOverflowPartialReply(text);
+          }
           logger.info(
             { group: group.name },
             `Agent output: ${raw.slice(0, 200)}`,
@@ -2011,6 +2626,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               try {
                 await streamingSession.complete(text);
                 streamingCardHandledIM = true;
+                // Streaming card replaced the normal sendMessage path,
+                // so clear the ack reaction that would normally be cleared in sendMessage.
+                imManager.clearAckReaction(chatJid);
                 logger.debug(
                   { chatJid },
                   'Streaming card completed with final text',
@@ -2020,22 +2638,73 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   { err, chatJid },
                   'Streaming card complete failed, falling back to static message',
                 );
+                // Abort the card so it doesn't stay stuck in "streaming" state
+                await streamingSession.abort('回复已通过消息发送').catch(() => {});
                 // Fall through to normal sendMessage
               }
             }
 
-            // For direct IM Feishu chats, if streaming card handled the reply,
-            // still store in DB + broadcast to web, but skip IM send.
-            const skipImSend = streamingCardHandledIM && directImReply;
+            // ── Rebuild streaming card after compact_partial / overflow_partial ──
+            // The completed card was consumed; create a new one so post-compaction
+            // tool-call progress remains visible on Feishu (#223).
+            if (
+              streamingCardHandledIM &&
+              (result.sourceKind === 'compact_partial' || result.sourceKind === 'overflow_partial')
+            ) {
+              unregisterStreamingSession(streamingSessionJid);
+              streamingAccumulatedText = '';
+              streamingAccumulatedThinking = '';
+              streamingSession = imManager.createStreamingSession(
+                streamingSessionJid,
+                makeOnCardCreated(streamingSessionJid),
+              );
+              if (streamingSession) {
+                registerStreamingSession(streamingSessionJid, streamingSession);
+                logger.debug(
+                  { chatJid, sourceKind: result.sourceKind },
+                  'Rebuilt streaming card after partial output',
+                );
+              }
+            }
+
+            // Skip IM send to the original chatJid when:
+            // 1. Streaming card already handled the IM delivery, OR
+            // 2. Reply route switched to a different IM channel (the routed IM
+            //    path below will deliver to the correct channel instead), OR
+            // 3. Reply route was cleared to null (web message injected into an
+            //    IM-originated session — replies should go to web only).
+            // Any send_message content is delivered independently via IPC watcher.
+            const routeCleared = directImReply && replySourceImJid === null;
+            const routeSwitchedAway = directImReply && replySourceImJid !== null && replySourceImJid !== chatJid;
+            const skipImSend = (streamingCardHandledIM && directImReply) || routeSwitchedAway || routeCleared;
+            // When the container stays alive and processes multiple IPC messages,
+            // result.turnId stays the same (set at container start).  If we already
+            // saved a reply with this turnId, the INSERT OR REPLACE would overwrite
+            // the previous reply.  Use a fresh ID to prevent that.
+            const effectiveTurnId = (result.turnId || lastProcessed.id);
+            const turnIdForDb = (sentReply && effectiveTurnId === lastSavedTurnId)
+              ? undefined  // no turnId → fresh INSERT, no UPSERT dedup
+              : effectiveTurnId;
+
             lastReplyMsgId = await sendMessage(chatJid, text, {
               sendToIM: directImReply && !skipImSend,
               localImagePaths,
+              messageMeta: {
+                turnId: turnIdForDb,
+                sessionId: result.sessionId || activeSessionId,
+                sdkMessageUuid: result.sdkMessageUuid,
+                sourceKind: result.sourceKind || 'sdk_final',
+                finalizationReason: result.finalizationReason || 'completed',
+              },
             });
+            lastSavedTurnId = effectiveTurnId;
 
-            // For routed IM (web JID with IM source), skip the source channel
-            // if streaming card handled it, but still relay to it otherwise.
+            // For routed IM (web JID with IM source), only send the FIRST
+            // substantive reply to IM. Subsequent results (e.g., SDK Task
+            // completions) are stored in DB but not spammed to IM.
+            // Streaming card already handles IM delivery for the first reply.
             if (replySourceImJid && replySourceImJid !== chatJid) {
-              if (!streamingCardHandledIM) {
+              if (!streamingCardHandledIM && !sentReply) {
                 sendImWithFailTracking(replySourceImJid, text, localImagePaths);
               }
             }
@@ -2057,6 +2726,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
 
             sentReply = true;
+            // Clear streaming snapshot so the next turn starts fresh.
+            // Without this, saveInterruptedStreamingMessages() would merge
+            // text from multiple turns into one message on shutdown.
+            clearStreamingSnapshot(chatJid);
+            streamingAccumulatedText = '';
+            streamingAccumulatedThinking = '';
             // Persist cursor as soon as a visible reply is emitted.
             // Long-lived runners may stay alive for idleTimeout, and waiting
             // until process exit would cause duplicate replay after restart.
@@ -2079,8 +2754,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
   } finally {
     await setTyping(chatJid, false);
+    // Always clear ack reaction in finally — covers error/interrupt/abort paths
+    // where the normal sendMessage (which clears it) is never called.
+    imManager.clearAckReaction(chatJid);
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
+    activeImReplyRoutes.delete(effectiveGroup.folder);
 
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted = streamInterrupted && !sentReply;
@@ -2100,21 +2779,64 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
-    if (wasInterrupted) {
-      const interruptedText = buildInterruptedReply(streamingAccumulatedText);
+    // Skip if the shutdown handler already saved this streaming text (prevents duplicates).
+    const webJidForShutdownCheck = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+    const alreadySavedByShutdown = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(webJidForShutdownCheck);
+
+    if (wasInterrupted && !alreadySavedByShutdown) {
+      const interruptedText = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
       try {
         // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
-        lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
+        lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
+          sendToIM: false,
+          messageMeta: {
+            turnId: lastProcessed.id,
+            sessionId: activeSessionId,
+            sourceKind: 'interrupt_partial',
+            finalizationReason: 'interrupted',
+          },
+        });
         sentReply = true;
         commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save interrupted text');
       }
     }
+
+    // ── 兜底：进程异常退出导致累积文本未持久化 ──
+    // 使用 buildInterruptedReply 而非 buildOverflowPartialReply：
+    // 进程被杀（SIGTERM/错误）后不会自动继续，"上下文压缩中"提示会误导用户。
+    if (!sentReply && !alreadySavedByShutdown && streamingAccumulatedText.trim()) {
+      try {
+        const partialReply = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
+        lastReplyMsgId = await sendMessage(chatJid, partialReply, {
+          sendToIM: false,
+          messageMeta: {
+            turnId: lastProcessed.id,
+            sessionId: activeSessionId,
+            sourceKind: 'interrupt_partial',
+            finalizationReason: 'error',
+          },
+        });
+        sentReply = true;
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Failed to save overflow partial text');
+      }
+    }
+
   }
 
-  // runAgent threw — output is undefined, cannot proceed with post-processing
-  if (!output) return true;
+  // runAgent threw — output is undefined, cannot proceed with post-processing.
+  // If a reply was already sent, commit the cursor so we don't re-process.
+  // Otherwise return false to allow retry (H-1 audit fix).
+  if (!output) {
+    if (sentReply) {
+      commitCursor();
+      return true;
+    }
+    return false;
+  }
 
   // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）：无论是否已有回复，都必须重置会话
   const errorForReset = [lastError, output.error].filter(Boolean).join(' ');
@@ -2252,12 +2974,68 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
 
+    // ── OOM auto-recovery: detect consecutive exit code 137 (OOM) ──
+    // Only match `code 137` (Docker cgroup OOM killer), not `signal SIGKILL`
+    // which is ambiguous for host processes (could be user stop, process tree
+    // kill, or actual OOM).  exitLabel is either `code N` or `signal X` —
+    // never both — so this only triggers on Docker container OOM exits.
+    const isOom = OOM_EXIT_RE.test(errorDetail);
+    if (isOom) {
+      const folder = effectiveGroup.folder;
+      consecutiveOomExits[folder] = (consecutiveOomExits[folder] || 0) + 1;
+      setRouterState(`oom_exits:${folder}`, String(consecutiveOomExits[folder]));
+      logger.warn(
+        { folder, consecutive: consecutiveOomExits[folder], threshold: OOM_AUTO_RESET_THRESHOLD },
+        'OOM exit detected (code 137)',
+      );
+
+      if (consecutiveOomExits[folder] >= OOM_AUTO_RESET_THRESHOLD) {
+        logger.warn(
+          { folder, consecutive: consecutiveOomExits[folder] },
+          'Consecutive OOM threshold reached, auto-resetting session to break death loop',
+        );
+        consecutiveOomExits[folder] = 0;
+        deleteRouterState(`oom_exits:${folder}`);
+
+        // Clear session files and DB records (same as unrecoverable_transcript handling)
+        try {
+          await clearSessionRuntimeFiles(folder);
+        } catch (err) {
+          logger.error({ folder, err }, 'Failed to clear session files during OOM auto-reset');
+        }
+        try {
+          deleteSession(folder);
+          delete sessions[folder];
+        } catch (err) {
+          logger.error({ folder, err }, 'Failed to clear session during OOM auto-reset');
+        }
+
+        sendSystemMessage(
+          chatJid,
+          'context_reset',
+          '会话文件过大导致内存溢出（OOM），已自动重置会话。之前的对话上下文已清除，请重新描述您的需求。',
+        );
+        commitCursor();
+        return true;
+      }
+    } else if (consecutiveOomExits[effectiveGroup.folder]) {
+      // Non-OOM error: reset the consecutive counter only if it was set
+      delete consecutiveOomExits[effectiveGroup.folder];
+      deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
+    }
+
     sendSystemMessage(chatJid, 'agent_error', errorDetail);
     logger.warn(
       { group: group.name, error: errorDetail },
       'Agent error (no reply sent), keeping cursor at previous position for retry',
     );
     return false;
+  }
+
+  // Reset OOM counter on successful exit (only write DB if counter was set)
+  if (consecutiveOomExits[effectiveGroup.folder]) {
+    delete consecutiveOomExits[effectiveGroup.folder];
+    deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
   }
 
   // Final fallback for silent-success paths (no visible reply).
@@ -2297,6 +3075,7 @@ async function runTerminalWarmup(chatJid: string): Promise<void> {
       group,
       warmupPrompt,
       chatJid,
+      undefined,
       async (result) => {
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
@@ -2370,6 +3149,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  turnId?: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   images?: Array<{ data: string; mimeType?: string }>,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
@@ -2425,6 +3205,7 @@ async function runAgent(
       }
     : undefined;
 
+  ipcWatcherManager?.watchGroup(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
 
@@ -2450,6 +3231,7 @@ async function runAgent(
         {
           prompt,
           sessionId,
+          turnId,
           groupFolder: group.folder,
           chatJid,
           isMain: isAdminHome,
@@ -2467,6 +3249,7 @@ async function runAgent(
         {
           prompt,
           sessionId,
+          turnId,
           groupFolder: group.folder,
           chatJid,
           isMain: isAdminHome,
@@ -2513,6 +3296,8 @@ async function runAgent(
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
     return { status: 'error', error: errorMsg };
+  } finally {
+    ipcWatcherManager?.unwatchGroup(group.folder);
   }
 }
 
@@ -2539,7 +3324,7 @@ async function sendMessage(
     const msgId = crypto.randomUUID();
     const timestamp = new Date().toISOString();
     ensureChatExists(jid);
-    storeMessageDirect(
+    const persistedMsgId = storeMessageDirect(
       msgId,
       jid,
       'happyclaw-agent',
@@ -2547,16 +3332,22 @@ async function sendMessage(
       text,
       timestamp,
       true,
+      { meta: options.messageMeta },
     );
 
     broadcastNewMessage(jid, {
-      id: msgId,
+      id: persistedMsgId,
       chat_jid: jid,
       sender: 'happyclaw-agent',
       sender_name: ASSISTANT_NAME,
       content: text,
       timestamp,
       is_from_me: true,
+      turn_id: options.messageMeta?.turnId ?? null,
+      session_id: options.messageMeta?.sessionId ?? null,
+      sdk_message_uuid: options.messageMeta?.sdkMessageUuid ?? null,
+      source_kind: options.messageMeta?.sourceKind ?? null,
+      finalization_reason: options.messageMeta?.finalizationReason ?? null,
     }, undefined, options.source);
     logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
     // Skip agent_reply broadcast for scheduled tasks to avoid clearing
@@ -2566,16 +3357,205 @@ async function sendMessage(
     if (!options.source) {
       broadcastToWebClients(jid, text);
     }
-    return msgId;
+    return persistedMsgId;
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
     return undefined;
   }
 }
 
-function buildInterruptedReply(partialText: string): string {
+function buildInterruptedReply(partialText: string, thinkingText?: string): string {
   const trimmed = partialText.trimEnd();
-  return trimmed ? `${trimmed}\n\n---\n*⚠️ 已中断*` : '*⚠️ 已中断*';
+  const trimmedThinking = thinkingText?.trimEnd();
+  const parts: string[] = [];
+  if (trimmedThinking) {
+    parts.push(`<details>\n<summary>💭 Reasoning (已中断)</summary>\n\n${trimmedThinking}\n\n</details>`);
+  }
+  if (trimmed) {
+    parts.push(trimmed);
+  }
+  parts.push('---\n*⚠️ 已中断*');
+  return parts.join('\n\n');
+}
+
+function buildOverflowPartialReply(partialText: string): string {
+  const trimmed = partialText.trimEnd();
+  return trimmed
+    ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，稍后自动继续*`
+    : '*⚠️ 上下文压缩中，稍后自动继续*';
+}
+
+/**
+ * Save any in-progress streaming responses to DB before shutdown.
+ * Without this, partial bot responses are lost when the service restarts.
+ */
+function saveInterruptedStreamingMessages(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) return;
+
+    logger.info(
+      { count: activeTexts.size },
+      'Saving interrupted streaming messages to DB',
+    );
+
+    for (const [jid, partialText] of activeTexts) {
+      if (!partialText.trim()) {
+        shutdownSavedJids.add(jid);
+        continue;
+      }
+      const interruptedText = buildInterruptedReply(partialText);
+      const msgId = crypto.randomUUID();
+      const timestamp = new Date().toISOString();
+      ensureChatExists(jid);
+      storeMessageDirect(
+        msgId,
+        jid,
+        'happyclaw-agent',
+        ASSISTANT_NAME,
+        interruptedText,
+        timestamp,
+        true,
+        {
+          meta: {
+            sourceKind: 'interrupt_partial',
+            finalizationReason: 'shutdown',
+          },
+        },
+      );
+      // Mark as saved so the per-group finally blocks don't duplicate
+      shutdownSavedJids.add(jid);
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error saving interrupted streaming messages');
+  }
+
+  // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
+  cleanStreamingBufferDir();
+}
+
+// ─── Periodic Streaming Buffer ──────────────────────────────────────
+// Writes in-progress streaming text to disk every 5s so that even SIGKILL
+// crashes preserve most of the partial response.
+
+const STREAMING_BUFFER_DIR = path.join(DATA_DIR, 'streaming-buffer');
+const STREAMING_BUFFER_INTERVAL_MS = 5000;
+let streamingBufferInterval: ReturnType<typeof setInterval> | null = null;
+
+function encodeJidForFilename(jid: string): string {
+  return Buffer.from(jid).toString('base64url');
+}
+
+function decodeJidFromFilename(filename: string): string {
+  const name = filename.endsWith('.txt') ? filename.slice(0, -4) : filename;
+  return Buffer.from(name, 'base64url').toString();
+}
+
+/** Write all active streaming texts to disk (atomic write per file). */
+function flushStreamingBuffer(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) {
+      // Nothing streaming — clean up any stale files
+      cleanStreamingBufferDir();
+      return;
+    }
+
+    fs.mkdirSync(STREAMING_BUFFER_DIR, { recursive: true });
+
+    const activeFiles = new Set<string>();
+    for (const [jid, text] of activeTexts) {
+      const filename = encodeJidForFilename(jid) + '.txt';
+      activeFiles.add(filename);
+      const filePath = path.join(STREAMING_BUFFER_DIR, filename);
+      const tmpPath = filePath + '.tmp';
+      fs.writeFileSync(tmpPath, text);
+      fs.renameSync(tmpPath, filePath);
+    }
+
+    // Remove files for JIDs that are no longer streaming
+    try {
+      for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+        if (f.endsWith('.txt') && !activeFiles.has(f)) {
+          fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+        }
+      }
+    } catch { /* ignore cleanup errors */ }
+  } catch (err) {
+    logger.debug({ err }, 'Error flushing streaming buffer');
+  }
+}
+
+/** On startup, recover interrupted responses from buffer files left by a crash. */
+function recoverStreamingBuffer(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+
+    const txtFiles = fs.readdirSync(STREAMING_BUFFER_DIR).filter((f) => f.endsWith('.txt'));
+    if (txtFiles.length === 0) return;
+
+    logger.info(
+      { count: txtFiles.length },
+      'Recovering interrupted streaming messages from buffer files',
+    );
+
+    for (const filename of txtFiles) {
+      try {
+        const jid = decodeJidFromFilename(filename);
+        const text = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
+        if (text.trim()) {
+          const interruptedText = buildInterruptedReply(text);
+          const msgId = crypto.randomUUID();
+          const timestamp = new Date().toISOString();
+          ensureChatExists(jid);
+          storeMessageDirect(
+            msgId,
+            jid,
+            'happyclaw-agent',
+            ASSISTANT_NAME,
+            interruptedText,
+            timestamp,
+            true,
+            {
+              meta: {
+                sourceKind: 'interrupt_partial',
+                finalizationReason: 'crash_recovery',
+              },
+            },
+          );
+          logger.info({ jid, textLen: text.length }, 'Recovered interrupted streaming message');
+        }
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, filename));
+      } catch (err) {
+        logger.warn({ err, filename }, 'Error recovering streaming buffer file');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error recovering streaming buffer');
+  }
+}
+
+/** Remove all buffer files. */
+function cleanStreamingBufferDir(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+    for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+      try {
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+function startStreamingBuffer(): void {
+  streamingBufferInterval = setInterval(flushStreamingBuffer, STREAMING_BUFFER_INTERVAL_MS);
+}
+
+function stopStreamingBuffer(): void {
+  if (streamingBufferInterval) {
+    clearInterval(streamingBufferInterval);
+    streamingBufferInterval = null;
+  }
 }
 
 /**
@@ -2613,22 +3593,44 @@ function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
-  const processIpcFiles = async () => {
-    if (shuttingDown) return;
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
-    }
+  const fsp = fs.promises;
 
-    for (const sourceGroup of groupFolders) {
+  /**
+   * Broadcast a message to all connected IM channels of a user that haven't
+   * already received it. Used by scheduled tasks to fan out to all IM channels.
+   */
+  function broadcastToOwnerIMChannels(
+    userId: string,
+    sourceFolder: string,
+    alreadySentJids: Set<string>,
+    sendFn: (jid: string) => void,
+    notifyChannels?: string[] | null,
+  ): void {
+    const sentChannelTypes = new Set<string>();
+    for (const jid of alreadySentJids) {
+      const ct = getChannelType(jid);
+      if (ct) sentChannelTypes.add(ct);
+    }
+    const connectedTypes = imManager.getConnectedChannelTypes(userId);
+    const ownerGroups = getGroupsByOwner(userId);
+    for (const channelType of connectedTypes) {
+      if (sentChannelTypes.has(channelType)) continue;
+      // Filter by notify_channels if specified (null = all channels)
+      if (notifyChannels && !notifyChannels.includes(channelType)) continue;
+      const target = ownerGroups.find(
+        (g) =>
+          getChannelType(g.jid) === channelType &&
+          g.folder === sourceFolder,
+      );
+      if (target) {
+        sendFn(target.jid);
+        sentChannelTypes.add(channelType);
+      }
+    }
+  }
+
+  const processGroupIpc = async (sourceGroup: string) => {
+    if (shuttingDown) return;
       // Determine if this IPC directory belongs to an admin home group
       const sourceGroupEntry = Object.values(registeredGroups).find(
         (g) => g.folder === sourceGroup,
@@ -2638,223 +3640,346 @@ function startIpcWatcher(): void {
       );
       const isHome = !!sourceGroupEntry?.is_home;
 
-      // Collect all IPC roots: main group dir + agents/*/
+      // Collect all IPC roots: main group dir + agents/*/ + tasks-run/*/
+      // Tag agent roots with their agentId so we can route messages to virtual JIDs.
       const groupIpcRoot = path.join(ipcBaseDir, sourceGroup);
-      const ipcRoots = [groupIpcRoot];
+      const ipcRoots: Array<{ path: string; agentId: string | null; taskId: string | null }> = [
+        { path: groupIpcRoot, agentId: null, taskId: null },
+      ];
       try {
         const agentsDir = path.join(groupIpcRoot, 'agents');
-        if (fs.existsSync(agentsDir)) {
-          for (const entry of fs.readdirSync(agentsDir, {
-            withFileTypes: true,
-          })) {
-            if (entry.isDirectory()) {
-              ipcRoots.push(path.join(agentsDir, entry.name));
-            }
+        const agentEntries = await fsp.readdir(agentsDir, {
+          withFileTypes: true,
+        });
+        for (const entry of agentEntries) {
+          if (entry.isDirectory()) {
+            ipcRoots.push({
+              path: path.join(agentsDir, entry.name),
+              agentId: entry.name,
+              taskId: null,
+            });
           }
         }
       } catch {
-        /* ignore */
+        /* agents dir may not exist */
+      }
+      try {
+        const tasksRunDir = path.join(groupIpcRoot, 'tasks-run');
+        const taskRunEntries = await fsp.readdir(tasksRunDir, {
+          withFileTypes: true,
+        });
+        for (const entry of taskRunEntries) {
+          if (entry.isDirectory()) {
+            ipcRoots.push({
+              path: path.join(tasksRunDir, entry.name),
+              agentId: null,
+              taskId: entry.name,
+            });
+          }
+        }
+      } catch {
+        /* tasks-run dir may not exist */
       }
 
-      for (const ipcRoot of ipcRoots) {
+      for (const { path: ipcRoot, agentId: ipcAgentId, taskId: ipcTaskId } of ipcRoots) {
         const messagesDir = path.join(ipcRoot, 'messages');
         const tasksDir = path.join(ipcRoot, 'tasks');
 
         // Process messages from this group's IPC directory
         try {
-          if (fs.existsSync(messagesDir)) {
-            const messageFiles = fs
-              .readdirSync(messagesDir)
-              .filter((f) => f.endsWith('.json'));
-            for (const file of messageFiles) {
-              const filePath = path.join(messagesDir, file);
-              try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                if (data.type === 'message' && data.chatJid && data.text) {
-                  const targetGroup = registeredGroups[data.chatJid];
-                  if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
-                  ) {
-                    await sendMessage(data.chatJid, data.text);
-                    logger.info(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'IPC message sent',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC message attempt blocked',
-                    );
-                  }
-                } else if (
-                  data.type === 'image' &&
-                  data.chatJid &&
-                  data.imageBase64
+          const messageEntries = await fsp.readdir(messagesDir);
+          const messageFiles = messageEntries.filter((f) =>
+            f.endsWith('.json'),
+          );
+          for (const file of messageFiles) {
+            const filePath = path.join(messagesDir, file);
+            try {
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
+              if (data.type === 'message' && data.chatJid && data.text) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
                 ) {
-                  // Handle image IPC messages from send_image MCP tool
-                  const targetGroup = registeredGroups[data.chatJid];
-                  if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
-                  ) {
-                    try {
-                      const imageBuffer = Buffer.from(
-                        data.imageBase64,
-                        'base64',
-                      );
-                      const mimeType = data.mimeType || 'image/png';
-                      const caption = data.caption || undefined;
-                      const fileName = data.fileName || undefined;
+                  // Conversation agents: route to virtual JID so message appears
+                  // in the agent tab, not the main conversation.
+                  const effectiveChatJid = ipcAgentId
+                    ? `${data.chatJid}#agent:${ipcAgentId}`
+                    : data.chatJid;
+                  await sendMessage(effectiveChatJid, data.text, {
+                    messageMeta: {
+                      sourceKind: 'sdk_send_message',
+                    },
+                  });
 
-                      // Send to IM channel (caption is included in the image message itself)
-                      await imManager.sendImage(
-                        data.chatJid,
-                        imageBuffer,
-                        mimeType,
-                        caption,
-                        fileName,
+                  // Forward to IM channel — but NOT for conversation agent messages.
+                  // Conversation agents handle their own IM routing in
+                  // processAgentConversation's wrappedOnOutput callback.
+                  if (!ipcAgentId) {
+                    const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
+                    if (
+                      ipcImRoute &&
+                      getChannelType(data.chatJid) === null &&
+                      ipcImRoute !== data.chatJid
+                    ) {
+                      const localImages = extractLocalImImagePaths(
+                        data.text,
+                        sourceGroup,
                       );
+                      sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                    }
 
-                      // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
-                      const displayText = caption
-                        ? `[图片: ${fileName || 'image'}]\n${caption}`
-                        : `[图片: ${fileName || 'image'}]`;
-                      const imgMsgId = crypto.randomUUID();
-                      const imgTimestamp = new Date().toISOString();
-                      ensureChatExists(data.chatJid);
-                      storeMessageDirect(
-                        imgMsgId,
-                        data.chatJid,
-                        'happyclaw-agent',
-                        ASSISTANT_NAME,
-                        displayText,
-                        imgTimestamp,
-                        true,
+                    // Scheduled task: broadcast to all connected IM channels of the owner
+                    if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, ipcImRoute].filter(Boolean) as string[],
                       );
-                      broadcastNewMessage(data.chatJid, {
-                        id: imgMsgId,
-                        chat_jid: data.chatJid,
-                        sender: 'happyclaw-agent',
-                        sender_name: ASSISTANT_NAME,
-                        content: displayText,
-                        timestamp: imgTimestamp,
-                        is_from_me: true,
-                      });
-                      broadcastToWebClients(data.chatJid, displayText);
-
-                      logger.info(
-                        {
-                          chatJid: data.chatJid,
-                          sourceGroup,
-                          mimeType,
-                          size: imageBuffer.length,
-                        },
-                        'IPC image sent',
+                      const taskLocalImages = extractLocalImImagePaths(
+                        data.text,
+                        sourceGroup,
                       );
-                    } catch (err) {
-                      logger.error(
-                        { chatJid: data.chatJid, sourceGroup, err },
-                        'Failed to process IPC image',
+                      // Resolve notify_channels from the task
+                      let taskNotifyChannels: string[] | null | undefined;
+                      if (ipcTaskId) {
+                        const taskRecord = getTaskById(ipcTaskId);
+                        taskNotifyChannels = taskRecord?.notify_channels;
+                      }
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        sourceGroup,
+                        alreadySent,
+                        (jid) =>
+                          sendImWithFailTracking(jid, data.text, taskLocalImages),
+                        taskNotifyChannels,
                       );
                     }
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC image attempt blocked',
+                  }
+                  logger.info(
+                    { chatJid: effectiveChatJid, sourceGroup, agentId: ipcAgentId },
+                    'IPC message sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'image' &&
+                data.chatJid &&
+                data.imageBase64
+              ) {
+                // Handle image IPC messages from send_image MCP tool
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
+                ) {
+                  try {
+                    const imageBuffer = Buffer.from(
+                      data.imageBase64,
+                      'base64',
+                    );
+                    const mimeType = data.mimeType || 'image/png';
+                    const caption = data.caption || undefined;
+                    const fileName = data.fileName || undefined;
+
+                    // Conversation agents: skip IM forwarding (handled in wrappedOnOutput).
+                    // Non-agent: route to IM via activeImReplyRoutes.
+                    const imgImRoute = ipcAgentId
+                      ? null
+                      : getChannelType(data.chatJid) !== null
+                        ? data.chatJid
+                        : activeImReplyRoutes.get(sourceGroup) ?? null;
+                    if (imgImRoute) {
+                      await retryImOperation('send_image', imgImRoute, () =>
+                        imManager.sendImage(imgImRoute, imageBuffer, mimeType, caption, fileName),
+                      );
+                    }
+
+                    // Conversation agents: store in virtual JID (agent tab).
+                    const imgChatJid = ipcAgentId
+                      ? `${data.chatJid}#agent:${ipcAgentId}`
+                      : data.chatJid;
+
+                    // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
+                    const displayText = caption
+                      ? `[图片: ${fileName || 'image'}]\n${caption}`
+                      : `[图片: ${fileName || 'image'}]`;
+                    const imgMsgId = crypto.randomUUID();
+                    const imgTimestamp = new Date().toISOString();
+                    ensureChatExists(imgChatJid);
+                    const persistedImgMsgId = storeMessageDirect(
+                      imgMsgId,
+                      imgChatJid,
+                      'happyclaw-agent',
+                      ASSISTANT_NAME,
+                      displayText,
+                      imgTimestamp,
+                      true,
+                      { meta: { sourceKind: 'sdk_send_message' } },
+                    );
+                    broadcastNewMessage(imgChatJid, {
+                      id: persistedImgMsgId,
+                      chat_jid: imgChatJid,
+                      sender: 'happyclaw-agent',
+                      sender_name: ASSISTANT_NAME,
+                      content: displayText,
+                      timestamp: imgTimestamp,
+                      is_from_me: true,
+                      turn_id: null,
+                      session_id: null,
+                      sdk_message_uuid: null,
+                      source_kind: 'sdk_send_message',
+                      finalization_reason: null,
+                    });
+                    broadcastToWebClients(imgChatJid, displayText);
+
+                    // Scheduled task: broadcast image to all connected IM channels
+                    // (not applicable for agent IPC)
+                    if (!ipcAgentId && data.isScheduledTask && sourceGroupEntry?.created_by) {
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
+                      );
+                      let imgTaskNotifyChannels: string[] | null | undefined;
+                      if (ipcTaskId) {
+                        const imgTaskRecord = getTaskById(ipcTaskId);
+                        imgTaskNotifyChannels = imgTaskRecord?.notify_channels;
+                      }
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        sourceGroup,
+                        alreadySent,
+                        (jid) =>
+                          imManager
+                            .sendImage(jid, imageBuffer, mimeType, caption, fileName)
+                            .catch((err) =>
+                              logger.warn(
+                                { jid, err },
+                                'Failed to broadcast task image to IM',
+                              ),
+                            ),
+                        imgTaskNotifyChannels,
+                      );
+                    }
+
+                    logger.info(
+                      {
+                        chatJid: imgChatJid,
+                        sourceGroup,
+                        mimeType,
+                        size: imageBuffer.length,
+                        agentId: ipcAgentId,
+                      },
+                      'IPC image sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to process IPC image',
                     );
                   }
-                }
-                fs.unlinkSync(filePath);
-              } catch (err) {
-                logger.error(
-                  { file, sourceGroup, err },
-                  'Error processing IPC message',
-                );
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
-                try {
-                  fs.renameSync(
-                    filePath,
-                    path.join(errorDir, `${sourceGroup}-${file}`),
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
                   );
-                } catch (renameErr) {
-                  logger.error(
-                    { file, sourceGroup, renameErr },
-                    'Failed to move IPC message to error directory, deleting',
-                  );
-                  try {
-                    fs.unlinkSync(filePath);
-                  } catch {
-                    /* ignore */
-                  }
                 }
               }
-            }
-          }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC messages directory',
-          );
-        }
-
-        // Process tasks from this group's IPC directory
-        try {
-          if (fs.existsSync(tasksDir)) {
-            const allEntries = fs.readdirSync(tasksDir, {
-              withFileTypes: true,
-            });
-
-            // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
-            for (const entry of allEntries) {
-              if (
-                entry.isFile() &&
-                entry.name.endsWith('.json') &&
-                (entry.name.startsWith('install_skill_result_') ||
-                  entry.name.startsWith('uninstall_skill_result_') ||
-                  entry.name.startsWith('set_env_var_result_'))
-              ) {
+              await fsp.unlink(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC message',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              await fsp.mkdir(errorDir, { recursive: true });
+              try {
+                await fsp.rename(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch (renameErr) {
+                logger.error(
+                  { file, sourceGroup, renameErr },
+                  'Failed to move IPC message to error directory, deleting',
+                );
                 try {
-                  const filePath = path.join(tasksDir, entry.name);
-                  const stat = fs.statSync(filePath);
-                  if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
-                    fs.unlinkSync(filePath);
-                    logger.debug(
-                      { sourceGroup, file: entry.name },
-                      'Cleaned up stale skill result file',
-                    );
-                  }
+                  await fsp.unlink(filePath);
                 } catch {
                   /* ignore */
                 }
               }
             }
+          }
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC messages directory',
+            );
+          }
+        }
+
+        // Process tasks from this group's IPC directory
+        try {
+          const allEntries = await fsp.readdir(tasksDir, {
+            withFileTypes: true,
+          });
 
           // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
-          const taskFiles = allEntries
-            .filter((entry) =>
+          for (const entry of allEntries) {
+            if (
               entry.isFile() &&
               entry.name.endsWith('.json') &&
-              !entry.name.startsWith('install_skill_result_') &&
-              !entry.name.startsWith('uninstall_skill_result_') &&
-              !entry.name.startsWith('set_env_var_result_')
+              (entry.name.startsWith('install_skill_result_') ||
+                entry.name.startsWith('uninstall_skill_result_') ||
+                entry.name.startsWith('list_tasks_result_') ||
+                entry.name.startsWith('set_env_var_result_'))
+            ) {
+              try {
+                const filePath = path.join(tasksDir, entry.name);
+                const stat = await fsp.stat(filePath);
+                if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
+                  await fsp.unlink(filePath);
+                  logger.debug(
+                    { sourceGroup, file: entry.name },
+                    'Cleaned up stale skill result file',
+                  );
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+
+          const taskFiles = allEntries
+            .filter(
+              (entry) =>
+                entry.isFile() &&
+                entry.name.endsWith('.json') &&
+                !entry.name.startsWith('install_skill_result_') &&
+                !entry.name.startsWith('uninstall_skill_result_') &&
+                !entry.name.startsWith('list_tasks_result_') &&
+                !entry.name.startsWith('set_env_var_result_'),
             )
             .map((entry) => entry.name);
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(
                 data,
@@ -2862,17 +3987,18 @@ function startIpcWatcher(): void {
                 isAdminHome,
                 isHome,
                 sourceGroupEntry,
+                ipcAgentId,
               );
-              fs.unlinkSync(filePath);
+              await fsp.unlink(filePath);
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
                 'Error processing IPC task',
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
+              await fsp.mkdir(errorDir, { recursive: true });
               try {
-                fs.renameSync(
+                await fsp.rename(
                   filePath,
                   path.join(errorDir, `${sourceGroup}-${file}`),
                 );
@@ -2882,28 +4008,56 @@ function startIpcWatcher(): void {
                   'Failed to move IPC task to error directory, deleting',
                 );
                 try {
-                  fs.unlinkSync(filePath);
+                  await fsp.unlink(filePath);
                 } catch {
                   /* ignore */
-                }
                 }
               }
             }
           }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC tasks directory',
-          );
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC tasks directory',
+            );
+          }
         }
       } // end for (const ipcRoot of ipcRoots)
-    }
-
-    if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
   };
 
-  processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  const processIpcFilesFull = async () => {
+    if (shuttingDown) return;
+    let groupFolders: string[];
+    try {
+      const entries = await fsp.readdir(ipcBaseDir, { withFileTypes: true });
+      groupFolders = entries
+        .filter((e) => e.isDirectory() && e.name !== 'errors')
+        .map((e) => e.name);
+    } catch (err) {
+      logger.error({ err }, 'Error reading IPC base directory');
+      return;
+    }
+
+    for (const sourceGroup of groupFolders) {
+      // Route through the concurrency guard to prevent racing with event-driven triggers
+      ipcWatcherManager!.triggerProcess(sourceGroup);
+    }
+  };
+
+  // Initialize the event-driven IPC watcher manager
+  ipcWatcherManager = new IpcWatcherManager();
+  ipcWatcherManager.bind(processGroupIpc, processIpcFilesFull);
+
+  // Initial full scan
+  processIpcFilesFull().catch((err) => {
+    logger.error({ err }, 'Error in initial IPC scan');
+  });
+
+  // Start fallback polling (5s instead of 1s)
+  ipcWatcherManager.startFallback();
+
+  logger.info('IPC watcher started (event-driven + 5s fallback)');
 }
 
 async function processTaskIpc(
@@ -2924,6 +4078,7 @@ async function processTaskIpc(
     name?: string;
     folder?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    executionMode?: string;
     // For install_skill / uninstall_skill
     package?: string;
     requestId?: string;
@@ -2935,11 +4090,14 @@ async function processTaskIpc(
     // For send_file
     filePath?: string;
     fileName?: string;
+    // For list_tasks
+    isAdminHome?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
   isHome: boolean, // Whether source is a home container
   sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
+  ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
 ): Promise<void> {
   switch (data.type) {
     case 'schedule_task':
@@ -3109,6 +4267,68 @@ async function processTaskIpc(
       }
       break;
 
+    case 'list_tasks':
+      if (data.requestId) {
+        const requestId = data.requestId;
+        if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+          logger.warn(
+            { sourceGroup, requestId },
+            'Rejected list_tasks request with invalid requestId',
+          );
+          break;
+        }
+        const listTasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+        const listTasksDirResolved = path.resolve(listTasksDir);
+        const resultFileName = `list_tasks_result_${requestId}.json`;
+        const resultFilePath = path.resolve(listTasksDir, resultFileName);
+        if (!resultFilePath.startsWith(`${listTasksDirResolved}${path.sep}`)) {
+          logger.warn(
+            { sourceGroup, requestId, resultFilePath },
+            'Rejected list_tasks request with unsafe result file path',
+          );
+          break;
+        }
+
+        fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+        try {
+          const allTasks = getAllTasks();
+          // Admin home sees all tasks, others only see their own group's tasks
+          const filteredTasks = isAdminHome
+            ? allTasks
+            : allTasks.filter((t) => t.group_folder === sourceGroup);
+          const taskList = filteredTasks.map((t) => ({
+            id: t.id,
+            groupFolder: t.group_folder,
+            prompt: t.prompt,
+            schedule_type: t.schedule_type,
+            schedule_value: t.schedule_value,
+            status: t.status,
+            next_run: t.next_run,
+          }));
+          const resultData = JSON.stringify({ success: true, tasks: taskList });
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.writeFileSync(tmpPath, resultData);
+          fs.renameSync(tmpPath, resultFilePath);
+          logger.debug(
+            { sourceGroup, taskCount: taskList.length },
+            'Task list sent via IPC',
+          );
+        } catch (err) {
+          const errorResult = JSON.stringify({
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.writeFileSync(tmpPath, errorResult);
+          fs.renameSync(tmpPath, resultFilePath);
+          logger.error(
+            { sourceGroup, err },
+            'Failed to list tasks via IPC',
+          );
+        }
+      }
+      break;
+
     case 'refresh_groups':
       // Only admin home group can request a refresh
       if (isAdminHome) {
@@ -3147,12 +4367,17 @@ async function processTaskIpc(
         const sourceEntry = Object.values(registeredGroups).find(
           (g) => g.folder === sourceGroup,
         );
+        const execMode =
+          data.executionMode === 'host' || data.executionMode === 'container'
+            ? data.executionMode
+            : undefined;
         registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
           created_by: sourceEntry?.created_by,
+          executionMode: execMode,
         });
       } else {
         logger.warn(
@@ -3335,9 +4560,25 @@ async function processTaskIpc(
             break;
           }
 
-          await imManager.sendFile(data.chatJid, resolvedPath, data.fileName);
+          // Route to IM: skip for conversation agents (they handle their own IM).
+          const fileImRoute = ipcAgentId
+            ? null
+            : getChannelType(data.chatJid) !== null
+              ? data.chatJid
+              : activeImReplyRoutes.get(sourceGroup) ?? null;
+          if (fileImRoute) {
+            const imFileName = data.fileName || path.basename(resolvedPath);
+            await retryImOperation('send_file', fileImRoute, () =>
+              imManager.sendFile(fileImRoute, resolvedPath, imFileName),
+            );
+          } else {
+            logger.debug(
+              { chatJid: data.chatJid, sourceGroup },
+              'No IM route for send_file, skipped IM delivery',
+            );
+          }
           logger.info(
-            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName },
+            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName, imRoute: fileImRoute },
             'File sent via IPC',
           );
         } catch (err) {
@@ -3414,10 +4655,10 @@ async function processAgentConversation(
   agentId: string,
 ): Promise<void> {
   const agent = getAgent(agentId);
-  if (!agent || agent.kind !== 'conversation') {
+  if (!agent || (agent.kind !== 'conversation' && agent.kind !== 'spawn')) {
     logger.warn(
       { chatJid, agentId },
-      'processAgentConversation: agent not found or not a conversation',
+      'processAgentConversation: agent not found or not a conversation/spawn',
     );
     return;
   }
@@ -3437,7 +4678,16 @@ async function processAgentConversation(
   // Get pending messages
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
   const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
-  if (missedMessages.length === 0) return;
+  if (missedMessages.length === 0) {
+    // Spawn agents are fire-and-forget: if no messages are found (race condition
+    // or cursor already advanced), mark as error so they don't stay idle forever.
+    if (agent.kind === 'spawn' && agent.status === 'idle') {
+      updateAgentStatus(agentId, 'error', '未找到待处理消息');
+      broadcastAgentStatus(chatJid, agentId, 'error', agent.name, agent.prompt, '未找到待处理消息');
+      logger.warn({ chatJid, agentId }, 'Spawn agent had no pending messages, marked as error');
+    }
+    return;
+  }
 
   const isHome = !!effectiveGroup.is_home;
   const isAdminHome = isHome && effectiveGroup.folder === MAIN_GROUP_FOLDER;
@@ -3462,15 +4712,45 @@ async function processAgentConversation(
     }
   }
 
+  // Fallback: if no IM source in current messages (e.g. web "继续" after
+  // restart), recover from the persisted last_im_jid in the DB (#225).
+  // Verify the channel is actually connected — stale JIDs from disabled
+  // channels would cause unnecessary retries and eventual auto-unbind.
+  if (!replySourceImJid) {
+    const agentRow = getAgent(agentId);
+    if (agentRow?.last_im_jid) {
+      if (imManager.isChannelAvailableForJid(agentRow.last_im_jid)) {
+        replySourceImJid = agentRow.last_im_jid;
+        logger.info(
+          { chatJid, agentId, recoveredImJid: replySourceImJid },
+          'Recovered IM routing from persisted last_im_jid',
+        );
+      } else {
+        logger.info(
+          { chatJid, agentId, staleImJid: agentRow.last_im_jid },
+          'Skipped last_im_jid recovery: channel disconnected',
+        );
+      }
+    }
+  }
+
+  // Persist the IM routing target so it survives service restarts.
+  if (replySourceImJid) {
+    updateAgentLastImJid(agentId, replySourceImJid);
+  }
+
   // ── Feishu Streaming Card (conversation agent) ──
   // Unlike processGroupMessages which falls back to chatJid, conversation agents
   // only stream when the message originates from an IM channel (replySourceImJid).
   // Web-only interactions don't need a Feishu streaming card.
-  const streamingSessionJid = replySourceImJid;
-  const agentStreamingSession = streamingSessionJid
+  // Use agent-scoped key to avoid colliding with the main session's streaming card (#242).
+  const streamingSessionJid = replySourceImJid
+    ? `${replySourceImJid}#agent:${agentId}`
+    : undefined;
+  let agentStreamingSession = replySourceImJid
     ? imManager.createStreamingSession(
-        streamingSessionJid,
-        (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
+        replySourceImJid,
+        (messageId) => registerMessageIdMapping(messageId, streamingSessionJid!),
       )
     : undefined;
   let agentStreamingAccText = '';
@@ -3500,24 +4780,23 @@ async function processAgentConversation(
   let hadError = false;
   let lastError = '';
   let lastAgentReplyMsgId: string | undefined;
+  let lastAgentReplyText: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
     if (cursorCommitted) return;
-    lastAgentTimestamp[virtualChatJid] = {
-      timestamp: lastProcessed.timestamp,
-      id: lastProcessed.id,
-    };
-    saveState();
+    advanceCursors(virtualChatJid, { timestamp: lastProcessed.timestamp, id: lastProcessed.id });
     cursorCommitted = true;
   };
 
   // Get or use agent-specific session
   const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
+  let currentAgentSessionId = sessionId;
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
     // Track session
     if (output.newSessionId && output.status !== 'error') {
       setSession(effectiveGroup.folder, output.newSessionId, agentId);
+      currentAgentSessionId = output.newSessionId;
     }
 
     // Stream events
@@ -3531,29 +4810,7 @@ async function processAgentConversation(
 
       // ── Feed stream events into Feishu streaming card ──
       if (agentStreamingSession) {
-        const se = output.streamEvent;
-        switch (se.eventType) {
-          case 'text_delta':
-            if (se.text) {
-              agentStreamingSession.append(agentStreamingAccText);
-            }
-            break;
-          case 'thinking_delta':
-            if (!agentStreamingAccText) {
-              agentStreamingSession.setThinking();
-            }
-            break;
-          case 'tool_use_start':
-            if (se.toolUseId && se.toolName) {
-              agentStreamingSession.startTool(se.toolUseId, se.toolName);
-            }
-            break;
-          case 'tool_use_end':
-            if (se.toolUseId) {
-              agentStreamingSession.endTool(se.toolUseId, false);
-            }
-            break;
-        }
+        feedStreamEventToCard(agentStreamingSession, output.streamEvent, agentStreamingAccText);
       }
 
       // ── 中断时立即保存已输出内容 ──
@@ -3571,11 +4828,32 @@ async function processAgentConversation(
             const msgId = crypto.randomUUID();
             const timestamp = new Date().toISOString();
             ensureChatExists(virtualChatJid);
-            storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
+            const persistedMsgId = storeMessageDirect(
+              msgId,
+              virtualChatJid,
+              'happyclaw-agent',
+              ASSISTANT_NAME,
+              interruptedText,
+              timestamp,
+              true,
+              {
+                meta: {
+                  turnId: output.streamEvent.turnId || lastProcessed.id,
+                  sessionId: output.streamEvent.sessionId || currentAgentSessionId,
+                  sourceKind: 'interrupt_partial',
+                  finalizationReason: 'interrupted',
+                },
+              },
+            );
             broadcastNewMessage(virtualChatJid, {
-              id: msgId, chat_jid: virtualChatJid,
+              id: persistedMsgId, chat_jid: virtualChatJid,
               sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
               content: interruptedText, timestamp, is_from_me: true,
+              turn_id: output.streamEvent.turnId || lastProcessed.id,
+              session_id: output.streamEvent.sessionId || currentAgentSessionId,
+              sdk_message_uuid: null,
+              source_kind: 'interrupt_partial',
+              finalization_reason: 'interrupted',
             }, agentId);
             commitCursor();
           } catch (err) {
@@ -3614,6 +4892,10 @@ async function processAgentConversation(
           );
         }
       }
+
+      // Reset idle timer on stream events so long-running tool calls
+      // don't get killed while the agent is actively working.
+      resetIdleTimer();
       return;
     }
 
@@ -3623,13 +4905,23 @@ async function processAgentConversation(
         typeof output.result === 'string'
           ? output.result
           : JSON.stringify(output.result);
-      const text = stripAgentInternalTags(raw);
+      let text = stripAgentInternalTags(raw);
+      if (output.sourceKind === 'overflow_partial' || output.sourceKind === 'compact_partial') {
+        // Spawn agents are fire-and-forget: context compression is an internal
+        // detail. Don't append the "上下文压缩中" suffix — it confuses users
+        // seeing the Feishu card suddenly change to a warning.
+        if (agent.kind !== 'spawn') {
+          text = buildOverflowPartialReply(text);
+        }
+      }
       if (text) {
+        const isFirstReply = !lastAgentReplyMsgId;
         const msgId = crypto.randomUUID();
         lastAgentReplyMsgId = msgId;
+        lastAgentReplyText = text;
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
-        storeMessageDirect(
+        const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
           'happyclaw-agent',
@@ -3637,17 +4929,31 @@ async function processAgentConversation(
           text,
           timestamp,
           true,
+          {
+            meta: {
+              turnId: output.turnId || lastProcessed.id,
+              sessionId: output.sessionId || currentAgentSessionId,
+              sdkMessageUuid: output.sdkMessageUuid,
+              sourceKind: output.sourceKind || 'sdk_final',
+              finalizationReason: output.finalizationReason || 'completed',
+            },
+          },
         );
         broadcastNewMessage(
           virtualChatJid,
           {
-            id: msgId,
+            id: persistedMsgId,
             chat_jid: virtualChatJid,
             sender: 'happyclaw-agent',
             sender_name: ASSISTANT_NAME,
             content: text,
             timestamp,
             is_from_me: true,
+            turn_id: output.turnId || lastProcessed.id,
+            session_id: output.sessionId || currentAgentSessionId,
+            sdk_message_uuid: output.sdkMessageUuid ?? null,
+            source_kind: output.sourceKind || 'sdk_final',
+            finalization_reason: output.finalizationReason || 'completed',
           },
           agentId,
         );
@@ -3668,11 +4974,53 @@ async function processAgentConversation(
               { err, chatJid, agentId },
               'Agent streaming card complete failed, falling back to static message',
             );
+            await agentStreamingSession.abort('回复已通过消息发送').catch(() => {});
           }
         }
 
-        if (replySourceImJid && !streamingCardHandledIM) {
-          sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+        // ── Rebuild streaming card after compact_partial / overflow_partial ──
+        // The completed card was consumed; create a new one so post-compaction
+        // tool-call progress remains visible on Feishu (#223).
+        if (
+          streamingCardHandledIM &&
+          (output.sourceKind === 'compact_partial' || output.sourceKind === 'overflow_partial') &&
+          streamingSessionJid
+        ) {
+          agentStreamingAccText = '';
+          unregisterStreamingSession(streamingSessionJid);
+          agentStreamingSession = imManager.createStreamingSession(
+            replySourceImJid!,
+            (messageId) => registerMessageIdMapping(messageId, streamingSessionJid!),
+          );
+          if (agentStreamingSession) {
+            registerStreamingSession(streamingSessionJid, agentStreamingSession);
+            logger.debug(
+              { chatJid, agentId, sourceKind: output.sourceKind },
+              'Rebuilt streaming card after partial output',
+            );
+          }
+        }
+
+        if (replySourceImJid && !streamingCardHandledIM && isFirstReply) {
+          // Only send the FIRST substantive reply to IM. Subsequent results
+          // (SDK Task completions) are stored in DB but not spammed to IM.
+          const imSent = await sendImWithRetry(replySourceImJid, text, localImagePaths);
+          if (imSent) {
+            logger.info(
+              { chatJid, agentId, replySourceImJid, sourceKind: output.sourceKind, textLen: text.length },
+              'Agent conversation: static IM message sent',
+            );
+          } else {
+            logger.error(
+              { chatJid, agentId, replySourceImJid, sourceKind: output.sourceKind },
+              'Agent conversation: IM send failed after all retries, message lost',
+            );
+          }
+        } else if (!replySourceImJid) {
+          logger.debug(
+            { chatJid, agentId, sourceKind: output.sourceKind },
+            'Agent conversation: no replySourceImJid, skip IM delivery',
+          );
         }
 
         // Optional mirror mode for linked IM channels
@@ -3686,6 +5034,19 @@ async function processAgentConversation(
 
         commitCursor();
         resetIdleTimer();
+
+        // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Skip for overflow_partial/compact_partial — those are intermediate context
+        // compression outputs, not the final result; closing now would kill the agent
+        // before it finishes the actual task.
+        if (
+          agent.kind === 'spawn' && text &&
+          output.sourceKind !== 'overflow_partial' &&
+          output.sourceKind !== 'compact_partial'
+        ) {
+          logger.info({ agentId, chatJid }, 'Spawn agent replied, sending close signal');
+          queue.closeStdin(virtualChatJid);
+        }
       }
     }
 
@@ -3695,6 +5056,7 @@ async function processAgentConversation(
     }
   };
 
+  ipcWatcherManager?.watchGroup(effectiveGroup.folder);
   try {
     const executionMode = effectiveGroup.executionMode || 'container';
     const onProcessCb = (proc: ChildProcess, identifier: string) => {
@@ -3712,6 +5074,7 @@ async function processAgentConversation(
     const containerInput: ContainerInput = {
       prompt,
       sessionId,
+      turnId: lastProcessed.id,
       groupFolder: effectiveGroup.folder,
       chatJid,
       isMain: isAdminHome,
@@ -3801,9 +5164,15 @@ async function processAgentConversation(
         'context_reset',
         `会话已自动重置：${detail}`,
       );
+      commitCursor();
     }
 
-    commitCursor();
+    // Only commit cursor if a reply was actually sent.  Without a reply the
+    // messages haven't been "processed" — leaving the cursor behind lets the
+    // recovery logic pick them up after a restart.
+    if (lastAgentReplyMsgId) {
+      commitCursor();
+    }
   } catch (err) {
     hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
@@ -3835,22 +5204,125 @@ async function processAgentConversation(
         const msgId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
-        storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
+        const persistedMsgId = storeMessageDirect(
+          msgId,
+          virtualChatJid,
+          'happyclaw-agent',
+          ASSISTANT_NAME,
+          interruptedText,
+          timestamp,
+          true,
+          {
+            meta: {
+              turnId: lastProcessed.id,
+              sessionId: currentAgentSessionId,
+              sourceKind: 'interrupt_partial',
+              finalizationReason: 'interrupted',
+            },
+          },
+        );
         broadcastNewMessage(virtualChatJid, {
-          id: msgId, chat_jid: virtualChatJid,
+          id: persistedMsgId, chat_jid: virtualChatJid,
           sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
           content: interruptedText, timestamp, is_from_me: true,
+          turn_id: lastProcessed.id,
+          session_id: currentAgentSessionId,
+          sdk_message_uuid: null,
+          source_kind: 'interrupt_partial',
+          finalization_reason: 'interrupted',
         }, agentId);
         commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text');
       }
     }
-  }
 
-  // Process ended → set status back to idle (conversation agents persist)
-  updateAgentStatus(agentId, 'idle');
-  broadcastAgentStatus(chatJid, agentId, 'idle', agent.name, agent.prompt);
+    // ── 兜底：进程异常退出导致累积文本未持久化 ──
+    if (!cursorCommitted && agentStreamingAccText.trim()) {
+      try {
+        const partialReply = buildInterruptedReply(agentStreamingAccText);
+        const msgId = crypto.randomUUID();
+        const timestamp = new Date().toISOString();
+        ensureChatExists(virtualChatJid);
+        const persistedMsgId = storeMessageDirect(
+          msgId,
+          virtualChatJid,
+          'happyclaw-agent',
+          ASSISTANT_NAME,
+          partialReply,
+          timestamp,
+          true,
+          {
+            meta: {
+              turnId: lastProcessed.id,
+              sessionId: currentAgentSessionId,
+              sourceKind: 'interrupt_partial',
+              finalizationReason: 'error',
+            },
+          },
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: persistedMsgId, chat_jid: virtualChatJid,
+          sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
+          content: partialReply, timestamp, is_from_me: true,
+          turn_id: lastProcessed.id,
+          session_id: currentAgentSessionId,
+          sdk_message_uuid: null,
+          source_kind: 'interrupt_partial',
+          finalization_reason: 'error',
+        }, agentId);
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted partial agent text');
+      }
+    }
+
+    // ── Spawn result injection: write final output back to the source chat ──
+    if (agent.kind === 'spawn' && agent.spawned_from_jid && lastAgentReplyText) {
+      try {
+        const resultText = lastAgentReplyText;
+        const injectId = crypto.randomUUID();
+        const injectTs = new Date().toISOString();
+        ensureChatExists(agent.spawned_from_jid);
+        storeMessageDirect(
+          injectId,
+          agent.spawned_from_jid,
+          'happyclaw-agent',
+          ASSISTANT_NAME,
+          resultText,
+          injectTs,
+          true,
+        );
+        broadcastNewMessage(agent.spawned_from_jid, {
+          id: injectId,
+          chat_jid: agent.spawned_from_jid,
+          sender: 'happyclaw-agent',
+          sender_name: ASSISTANT_NAME,
+          content: resultText,
+          timestamp: injectTs,
+          is_from_me: true,
+        });
+        logger.info(
+          { agentId, spawned_from_jid: agent.spawned_from_jid, textLen: lastAgentReplyText.length },
+          'Spawn result injected back to source chat',
+        );
+      } catch (err) {
+        logger.error({ agentId, err }, 'Failed to inject spawn result back to source chat');
+      }
+    }
+
+    // Process ended → set status back to idle (conversation agents persist).
+    // Spawn agents are fire-and-forget: mark as completed (or error) so they
+    // don't accumulate in the active agent list.
+    // MUST be inside finally so status is reset even on unhandled exceptions (#227).
+    const endStatus = agent.kind === 'spawn'
+      ? (hadError ? 'error' : 'completed')
+      : 'idle';
+    updateAgentStatus(agentId, endStatus, hadError ? lastError : undefined);
+    broadcastAgentStatus(chatJid, agentId, endStatus, agent.name, agent.prompt, hadError ? lastError : undefined);
+
+    ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
+  }
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -3939,11 +5411,7 @@ async function startMessageLoop(): Promise<void> {
 
                 // Advance cursor past these messages so they aren't re-processed
                 const lastMsg = groupMessages[groupMessages.length - 1];
-                lastAgentTimestamp[chatJid] = {
-                  timestamp: lastMsg.timestamp,
-                  id: lastMsg.id,
-                };
-                saveState();
+                setCursors(chatJid, { timestamp: lastMsg.timestamp, id: lastMsg.id });
                 continue;
               }
             }
@@ -3968,9 +5436,6 @@ async function startMessageLoop(): Promise<void> {
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
 
-          const lastRawText = messagesToSend[messagesToSend.length - 1].content;
-          const intent = analyzeIntent(lastRawText);
-
           // Determine the IM source JID for route update on successful injection
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
@@ -3979,7 +5444,6 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             formatted,
             imagesForAgent,
-            intent,
             () => {
               // IPC write succeeded — update reply route for the running agent
               activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
@@ -4000,32 +5464,6 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             };
             saveState();
-          } else if (sendResult === 'interrupted_stop') {
-            // Stop intent: update cursor, don't enqueue (agent stops)
-            const lastProcessed = messagesToSend[messagesToSend.length - 1];
-            lastAgentTimestamp[chatJid] = {
-              timestamp: lastProcessed.timestamp,
-              id: lastProcessed.id,
-            };
-            saveState();
-          } else if (sendResult === 'interrupted_correction') {
-            // Correction intent: update cursor; the IPC message was written so the
-            // interrupted agent will pick it up in its session loop after the abort.
-            // No enqueueMessageCheck needed — the existing agent handles it.
-            const lastProcessed = messagesToSend[messagesToSend.length - 1];
-            lastAgentTimestamp[chatJid] = {
-              timestamp: lastProcessed.timestamp,
-              id: lastProcessed.id,
-            };
-            saveState();
-          } else if (sendResult === 'queued') {
-            // Message queued for next container run. Don't advance cursor so
-            // processGroupMessages re-reads it from DB. Drain sentinel will
-            // cause the current container to exit, then drainGroup handles it.
-            logger.debug(
-              { chatJid },
-              'Message queued (drain mode), cursor not advanced',
-            );
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -4042,7 +5480,7 @@ async function startMessageLoop(): Promise<void> {
       recoverStuckPendingGroups();
     }
 
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+    await interruptibleSleep(POLL_INTERVAL);
   }
 }
 
@@ -4064,18 +5502,130 @@ function recoverStuckPendingGroups(): void {
 
 /**
  * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing global cursor and processing messages.
+ *
+ * Uses `lastCommittedCursor` (updated only in commitCursor when an agent
+ * actually finishes processing) rather than `lastAgentTimestamp` (which
+ * advances when IPC injection succeeds).  This correctly detects messages
+ * that were IPC-injected but never processed because the service was
+ * killed before the agent could handle them.
+ *
+ * When pending messages are found, the group's SDK session is cleared to
+ * prevent the "session ghost" bug: if the previous agent was killed mid-
+ * response (SIGKILL / crash), the SDK session is left in a dirty state.
+ * Resuming it would cause the agent to complete the OLD interrupted work
+ * instead of processing the NEW pending messages, sending irrelevant
+ * replies to the user.
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
+    // No committed cursor → this group was never successfully processed.
+    // Skip recovery — the normal 2s message loop will pick up any pending messages.
+    // Using EMPTY_CURSOR here would match ALL historical messages and falsely
+    // trigger session clearing (the bug that caused context reset on restart).
+    const sinceCursor = lastCommittedCursor[chatJid];
+    if (!sinceCursor) continue;
+
     const pending = getMessagesSince(chatJid, sinceCursor);
     if (pending.length > 0) {
+      // Clear stale session to avoid "session ghost" — the agent will start
+      // a fresh conversation and process the pending messages cleanly.
+      if (sessions[group.folder]) {
+        logger.info(
+          { group: group.name, folder: group.folder },
+          'Recovery: clearing stale session to prevent session ghost',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
+
       logger.info(
         { group: group.name, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
       );
+      recoveryGroups.add(chatJid);
       queue.enqueueMessageCheck(chatJid);
+    }
+  }
+}
+
+/**
+ * Startup recovery for conversation agents.
+ * After restart, running conversation agents have dead processes.
+ * Reset their status and re-trigger processing if they have pending messages.
+ */
+function recoverConversationAgents(): void {
+  const agents = listActiveConversationAgents();
+  if (agents.length === 0) return;
+
+  logger.info(
+    { count: agents.length },
+    'Recovery: found active conversation agents from previous session',
+  );
+
+  for (const agent of agents) {
+    try {
+      const chatJid = agent.chat_jid;
+      const agentId = agent.id;
+
+      // Reset running → idle (process is dead)
+      if (agent.status === 'running') {
+        updateAgentStatus(agentId, 'idle');
+        broadcastAgentStatus(
+          chatJid,
+          agentId,
+          'idle',
+          agent.name,
+          agent.prompt,
+          agent.result_summary ?? undefined,
+          agent.kind,
+        );
+      }
+
+      // Check for pending messages on the virtual JID
+      const virtualChatJid = `${chatJid}#agent:${agentId}`;
+      const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+      const pending = getMessagesSince(virtualChatJid, sinceCursor);
+
+      if (pending.length > 0) {
+        logger.info(
+          { agentId, agentName: agent.name, pendingCount: pending.length },
+          'Recovery: re-triggering conversation agent with pending messages',
+        );
+
+        // Store a system notice so the user sees something in the chat
+        const now = new Date().toISOString();
+        const noticeId = `system-recover-${agentId}-${Date.now()}`;
+        storeMessageDirect(
+          noticeId,
+          virtualChatJid,
+          'system',
+          ASSISTANT_NAME,
+          '服务已重启，正在恢复上次未完成的任务...',
+          now,
+          true,
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: noticeId,
+          chat_jid: virtualChatJid,
+          sender: 'system',
+          sender_name: ASSISTANT_NAME,
+          content: '服务已重启，正在恢复上次未完成的任务...',
+          timestamp: now,
+          is_from_me: true,
+          source_jid: virtualChatJid,
+        });
+
+        // Enqueue the agent conversation for processing
+        const taskId = `agent-recover:${agentId}:${Date.now()}`;
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          await processAgentConversation(chatJid, agentId);
+        });
+      }
+    } catch (err) {
+      logger.error(
+        { err, agentId: agent.id, groupFolder: agent.group_folder },
+        'Recovery: failed to recover conversation agent, skipping',
+      );
     }
   }
 }
@@ -4087,39 +5637,45 @@ async function ensureDockerRunning(): Promise<void> {
     return;
   }
 
+  if (!(await isDockerAvailable())) {
+    logger.warn(
+      'Docker is not available — container-mode workspaces will fail at message time. ' +
+      'Start Docker if you need container execution (macOS: Docker Desktop, Linux: sudo systemctl start docker).',
+    );
+    return;
+  }
+  logger.debug('Docker daemon is running');
+
+  // Kill orphaned host agent-runner processes from previous runs
   try {
-    await execFileAsync('docker', ['info'], { timeout: 10000 });
-    logger.debug('Docker daemon is running');
-  } catch {
-    logger.error('Docker daemon is not running');
-    console.error(
-      '\n╔════════════════════════════════════════════════════════════════╗',
-    );
-    console.error(
-      '║  FATAL: Docker is not running                                  ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Agents cannot run without Docker. To fix:                     ║',
-    );
-    console.error(
-      '║  macOS: Start Docker Desktop                                   ║',
-    );
-    console.error(
-      '║  Linux: sudo systemctl start docker                            ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Install from: https://docker.com/products/docker-desktop      ║',
-    );
-    console.error(
-      '╚════════════════════════════════════════════════════════════════╝\n',
-    );
-    throw new Error('Docker is required but not running');
+    const { stdout: psOut } = await execFileAsync('pgrep', [
+      '-f',
+      'node.*container/agent-runner/dist/index\\.js',
+    ], { timeout: 5000 });
+    const pids = (typeof psOut === 'string' ? psOut : String(psOut))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(Number)
+      .filter((pid) => pid !== process.pid && !isNaN(pid));
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already dead */
+      }
+    }
+    if (pids.length > 0) {
+      logger.info(
+        { count: pids.length, pids },
+        'Killed orphaned host agent-runner processes',
+      );
+    }
+  } catch (err: any) {
+    // pgrep exits 1 when no matches — that's fine
+    if (err?.code !== 1) {
+      logger.warn({ err }, 'Failed to clean up orphaned host processes');
+    }
   }
 
   // Kill and clean up orphaned happyclaw containers from previous runs
@@ -4293,6 +5849,20 @@ function buildOnNewChat(
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
         }
+        return;
+      }
+
+      // Backfill missing created_by without changing folder binding.
+      // Legacy IM groups may have NULL created_by after migration;
+      // we should claim ownership but preserve the user's chosen folder.
+      if (!existing.created_by) {
+        existing.created_by = userId;
+        setRegisteredGroup(chatJid, existing);
+        registeredGroups[chatJid] = existing;
+        logger.info(
+          { chatJid, chatName, userId, folder: existing.folder },
+          'Backfilled created_by for IM chat (preserved existing folder)',
+        );
         return;
       }
 
@@ -4532,8 +6102,10 @@ function shouldProcessGroupMessage(chatJid: string): boolean {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return false;
 
-  // activation_mode 优先于 require_mention
+  // activation_mode 直接存在 IM 群组自身的 registered_groups 记录上（绑定时设置），
+  // 无需追溯 target_main_jid
   const mode = group.activation_mode ?? 'auto';
+
   switch (mode) {
     case 'always':
       return true; // 群聊不需要 @bot
@@ -4549,27 +6121,19 @@ function shouldProcessGroupMessage(chatJid: string): boolean {
 }
 
 /**
- * 中断 fast-path 回调：IM 消息到达时立即触发中断，绕过 2s 轮询延迟。
- * 模块级函数，所有 IM 连接共享。
+ * 飞书流式卡片按钮中断回调。
+ * 仅由飞书卡片按钮触发，不涉及自动关键词检测。
  */
-function handleIMInterruptRequest(
-  chatJid: string,
-  intent: 'stop' | 'correction',
-): void {
+function handleCardInterrupt(chatJid: string): void {
   const interrupted = queue.interruptQuery(chatJid);
   if (interrupted) {
-    logger.info(
-      { chatJid, intent },
-      'Interrupt fast-path: query interrupted immediately',
-    );
+    logger.info({ chatJid }, 'Card interrupt: query interrupted');
   }
 
-  // Immediately abort the streaming card so the user sees "已中断" right away,
-  // without waiting for the agent-runner to process the interrupt sentinel.
   const session = getStreamingSession(chatJid);
   if (session?.isActive()) {
     session.abort('用户中断').catch((err) => {
-      logger.debug({ err, chatJid }, 'Failed to abort streaming card on interrupt');
+      logger.debug({ err, chatJid }, 'Failed to abort streaming card');
     });
   }
 }
@@ -4584,8 +6148,9 @@ async function connectUserIMChannels(
   feishuConfig?: FeishuConnectConfig | null,
   telegramConfig?: TelegramConnectConfig | null,
   qqConfig?: QQConnectConfig | null,
+  wechatConfig?: WeChatConnectConfig | null,
   ignoreMessagesBefore?: number,
-): Promise<{ feishu: boolean; telegram: boolean; qq: boolean }> {
+): Promise<{ feishu: boolean; telegram: boolean; qq: boolean; wechat: boolean }> {
   const onNewChat = buildOnNewChat(userId, homeFolder);
   const resolveGroupFolder = (chatJid: string): string | undefined => {
     return resolveEffectiveFolder(chatJid);
@@ -4598,19 +6163,30 @@ async function connectUserIMChannels(
   let feishu = false;
   let telegram = false;
   let qq = false;
+  let wechat = false;
 
-  if (feishuConfig && feishuConfig.enabled !== false && feishuConfig.appId && feishuConfig.appSecret) {
-    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, {
-      ignoreMessagesBefore,
-      onCommand: handleCommand,
-      resolveGroupFolder,
-      resolveEffectiveChatJid,
-      onAgentMessage,
-      onBotAddedToGroup,
-      onBotRemovedFromGroup,
-      shouldProcessGroupMessage,
-      onInterruptRequest: handleIMInterruptRequest,
-    });
+  if (
+    feishuConfig &&
+    feishuConfig.enabled !== false &&
+    feishuConfig.appId &&
+    feishuConfig.appSecret
+  ) {
+    feishu = await imManager.connectUserFeishu(
+      userId,
+      feishuConfig,
+      onNewChat,
+      {
+        ignoreMessagesBefore,
+        onCommand: handleCommand,
+        resolveGroupFolder,
+        resolveEffectiveChatJid,
+        onAgentMessage,
+        onBotAddedToGroup,
+        onBotRemovedFromGroup,
+        shouldProcessGroupMessage,
+        onCardInterrupt: handleCardInterrupt,
+      },
+    );
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
@@ -4622,12 +6198,12 @@ async function connectUserIMChannels(
       buildOnPairAttempt(userId),
       {
         onCommand: handleCommand,
+        ignoreMessagesBefore,
         resolveGroupFolder,
         resolveEffectiveChatJid,
         onAgentMessage,
         onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
         onBotRemovedFromGroup,
-        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -4649,12 +6225,31 @@ async function connectUserIMChannels(
         resolveGroupFolder,
         resolveEffectiveChatJid,
         onAgentMessage,
-        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
 
-  return { feishu, telegram, qq };
+  if (
+    wechatConfig &&
+    wechatConfig.enabled !== false &&
+    wechatConfig.botToken &&
+    wechatConfig.ilinkBotId
+  ) {
+    wechat = await imManager.connectUserWeChat(
+      userId,
+      wechatConfig,
+      onNewChat,
+      {
+        ignoreMessagesBefore,
+        onCommand: handleCommand,
+        resolveGroupFolder,
+        resolveEffectiveChatJid,
+        onAgentMessage,
+      },
+    );
+  }
+
+  return { feishu, telegram, qq, wechat };
 }
 
 function movePathWithFallback(src: string, dst: string): void {
@@ -4820,12 +6415,12 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
 
-  // Clean up stale completed task agents (older than 1 hour) to prevent DB bloat
+  // Clean up stale completed agents (task + spawn, older than 1 hour) to prevent DB bloat
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const cleaned = deleteCompletedTaskAgents(oneHourAgo);
+    const cleaned = deleteCompletedAgents(oneHourAgo);
     if (cleaned > 0) {
-      logger.info({ cleaned }, 'Cleaned up stale completed task agents');
+      logger.info({ cleaned }, 'Cleaned up stale completed agents');
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up stale task agents');
@@ -4844,6 +6439,23 @@ async function main(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'Failed to mark stale running tasks at startup');
   }
+
+  // Spawn agents (from /sw) lose their in-memory task callbacks on restart.
+  // Mark idle/running spawn agents as error so they don't render as "正在思考...".
+  try {
+    const marked = markStaleSpawnAgentsAsError();
+    if (marked > 0) {
+      logger.warn(
+        { marked },
+        'Marked stale spawn agents as error at startup',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to mark stale spawn agents at startup');
+  }
+
+  // WeChat iLink API domains bypass proxy (applied at startup, updated on config save)
+  updateWeChatNoProxy(true);
 
   // Migrate system-level IM config → admin's per-user config (one-time)
   migrateSystemIMToPerUser();
@@ -4865,9 +6477,22 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
+    // Force exit after 2s if graceful shutdown hangs
+    const forceExitTimer = setTimeout(() => {
+      logger.warn('Graceful shutdown timed out, force exiting');
+      process.exit(1);
+    }, 2000);
+    forceExitTimer.unref();
+
     if (feishuSyncInterval) {
       clearInterval(feishuSyncInterval);
       feishuSyncInterval = null;
+    }
+
+    try {
+      ipcWatcherManager?.closeAll();
+    } catch (err) {
+      logger.warn({ err }, 'Error closing IPC watchers');
     }
 
     try {
@@ -4875,28 +6500,29 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
     }
-    // Abort all active streaming cards before disconnecting IM,
-    // so users see "服务维护中" instead of a stuck "生成中..." card.
-    try {
-      await abortAllStreamingSessions('服务维护中');
-    } catch (err) {
-      logger.warn({ err }, 'Error aborting streaming sessions');
-    }
-    try {
-      await imManager.disconnectAll();
-    } catch (err) {
-      logger.warn({ err }, 'Error disconnecting IM connections');
-    }
-    try {
-      await shutdownWebServer();
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down web server');
-    }
-    try {
-      await queue.shutdown(10000);
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down queue');
-    }
+
+    // Stop periodic buffer, then persist streaming text to DB + clean buffer files.
+    stopStreamingBuffer();
+    saveInterruptedStreamingMessages();
+
+    // Run cleanup tasks concurrently with a tight timeout
+    await Promise.allSettled([
+      // Abort all active streaming cards before disconnecting IM,
+      // so users see "服务维护中" instead of a stuck "生成中..." card.
+      abortAllStreamingSessions('服务维护中').catch((err) =>
+        logger.warn({ err }, 'Error aborting streaming sessions'),
+      ),
+      imManager.disconnectAll().catch((err) =>
+        logger.warn({ err }, 'Error disconnecting IM connections'),
+      ),
+      shutdownWebServer().catch((err) =>
+        logger.warn({ err }, 'Error shutting down web server'),
+      ),
+      queue.shutdown(1500).catch((err) =>
+        logger.warn({ err }, 'Error shutting down queue'),
+      ),
+    ]);
+
     try {
       closeDatabase();
     } catch (err) {
@@ -4937,7 +6563,7 @@ async function main(): Promise<void> {
           onBotAddedToGroup: buildOnNewChat('', ''),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
-          onInterruptRequest: handleIMInterruptRequest,
+          onCardInterrupt: handleCardInterrupt,
         },
       );
       if (connected) {
@@ -4988,6 +6614,7 @@ async function main(): Promise<void> {
         buildOnPairAttempt(adminUser.id),
         {
           onCommand: handleCommand,
+          ignoreMessagesBefore: Date.now(),
           resolveGroupFolder: (chatJid) => resolveEffectiveFolder(chatJid),
           resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
           onAgentMessage: buildOnAgentMessage(),
@@ -4996,7 +6623,6 @@ async function main(): Promise<void> {
             homeFolder,
           ),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-          onInterruptRequest: handleIMInterruptRequest,
         },
       );
       return connected;
@@ -5008,7 +6634,7 @@ async function main(): Promise<void> {
   // Reload a per-user IM channel (hot-reload on user-im config save)
   const reloadUserIMConfig = async (
     userId: string,
-    channel: 'feishu' | 'telegram' | 'qq',
+    channel: 'feishu' | 'telegram' | 'qq' | 'wechat',
   ): Promise<boolean> => {
     const homeGroup = getUserHomeGroup(userId);
     if (!homeGroup) {
@@ -5041,7 +6667,7 @@ async function main(): Promise<void> {
             onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
-            onInterruptRequest: handleIMInterruptRequest,
+            onCardInterrupt: handleCardInterrupt,
           },
         );
         logger.info(
@@ -5068,13 +6694,13 @@ async function main(): Promise<void> {
           buildOnPairAttempt(userId),
           {
             onCommand: handleCommand,
+            ignoreMessagesBefore,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
             onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info(
@@ -5085,8 +6711,7 @@ async function main(): Promise<void> {
       }
       logger.info({ userId }, 'User Telegram channel disabled via hot-reload');
       return false;
-    } else {
-      // QQ
+    } else if (channel === 'qq') {
       await imManager.disconnectUserQQ(userId);
       const config = getUserQQConfig(userId);
       if (
@@ -5107,13 +6732,49 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
-            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info({ userId, connected }, 'User QQ connection hot-reloaded');
         return connected;
       }
       logger.info({ userId }, 'User QQ channel disabled via hot-reload');
+      return false;
+    } else {
+      // WeChat
+      await imManager.disconnectUserWeChat(userId);
+      const config = getUserWeChatConfig(userId);
+      if (
+        config &&
+        config.enabled !== false &&
+        config.botToken &&
+        config.ilinkBotId
+      ) {
+        const connected = await imManager.connectUserWeChat(
+          userId,
+          {
+            botToken: config.botToken,
+            ilinkBotId: config.ilinkBotId,
+            baseUrl: config.baseUrl,
+            cdnBaseUrl: config.cdnBaseUrl,
+            getUpdatesBuf: config.getUpdatesBuf,
+          },
+          onNewChat,
+          {
+            ignoreMessagesBefore: Date.now(),
+            onCommand: handleCommand,
+            resolveGroupFolder: (chatJid: string) =>
+              resolveEffectiveFolder(chatJid),
+            resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+            onAgentMessage: buildOnAgentMessage(),
+          },
+        );
+        logger.info(
+          { userId, connected },
+          'User WeChat connection hot-reloaded',
+        );
+        return connected;
+      }
+      logger.info({ userId }, 'User WeChat channel disabled via hot-reload');
       return false;
     }
   };
@@ -5127,10 +6788,7 @@ async function main(): Promise<void> {
     ensureTerminalContainerStarted,
     formatMessages,
     getLastAgentTimestamp: () => lastAgentTimestamp,
-    setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
-      lastAgentTimestamp[jid] = cursor;
-      saveState();
-    },
+    setLastAgentTimestamp: setCursors,
     advanceGlobalCursor: (cursor: MessageCursor) => {
       if (isCursorAfter(cursor, globalMessageCursor)) {
         globalMessageCursor = cursor;
@@ -5147,6 +6805,8 @@ async function main(): Promise<void> {
     isUserTelegramConnected: (userId: string) =>
       imManager.isTelegramConnected(userId),
     isUserQQConnected: (userId: string) => imManager.isQQConnected(userId),
+    isUserWeChatConnected: (userId: string) =>
+      imManager.isWeChatConnected(userId),
     processAgentConversation,
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
@@ -5156,12 +6816,15 @@ async function main(): Promise<void> {
     updateReplyRoute: (folder: string, sourceJid: string | null) => {
       activeRouteUpdaters.get(folder)?.(sourceJid);
     },
+    handleSpawnCommand,
   });
 
   // Clean expired sessions every hour
   setInterval(
     () => {
       try {
+        const expiredIds = getExpiredSessionIds();
+        for (const id of expiredIds) invalidateSessionCache(id);
         const deleted = deleteExpiredSessions();
         if (deleted > 0) {
           logger.info({ deleted }, 'Cleaned expired user sessions');
@@ -5171,6 +6834,22 @@ async function main(): Promise<void> {
       }
     },
     60 * 60 * 1000,
+  );
+
+  // Periodically clean completed agents (task + spawn, every 10 minutes)
+  setInterval(
+    () => {
+      try {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        const cleaned = deleteCompletedAgents(tenMinutesAgo);
+        if (cleaned > 0) {
+          logger.info({ cleaned }, 'Periodic cleanup: removed completed agents');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Failed periodic task agent cleanup');
+      }
+    },
+    10 * 60 * 1000,
   );
 
   // Billing: check expired subscriptions every hour
@@ -5226,15 +6905,89 @@ async function main(): Promise<void> {
     24 * 60 * 60 * 1000,
   );
 
+  // Skills auto-sync: periodically sync host skills to all admin users
+  let skillAutoSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startSkillAutoSync(): void {
+    stopSkillAutoSync();
+    const settings = getSystemSettings();
+    if (!settings.skillAutoSyncEnabled) return;
+
+    const intervalMs = settings.skillAutoSyncIntervalMinutes * 60 * 1000;
+    logger.info(
+      { intervalMinutes: settings.skillAutoSyncIntervalMinutes },
+      'Starting skill auto-sync timer',
+    );
+
+    const runSync = async () => {
+      const currentSettings = getSystemSettings();
+      if (!currentSettings.skillAutoSyncEnabled) {
+        stopSkillAutoSync();
+        return;
+      }
+
+      try {
+        const { users: adminUsers } = listUsers({ role: 'admin', status: 'active' });
+        for (const admin of adminUsers) {
+          try {
+            const result = await syncHostSkillsForUser(admin.id);
+            const { added, updated, deleted } = result.stats;
+            if (added > 0 || updated > 0 || deleted > 0) {
+              logger.info(
+                { userId: admin.id, username: admin.username, ...result.stats, total: result.total },
+                'Skill auto-sync completed with changes',
+              );
+            }
+          } catch (err) {
+            logger.warn({ err, userId: admin.id }, 'Skill auto-sync failed for user');
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, 'Skill auto-sync failed');
+      }
+    };
+
+    // Run once immediately, then on interval
+    void runSync();
+    skillAutoSyncTimer = setInterval(() => void runSync(), intervalMs);
+  }
+
+  function stopSkillAutoSync(): void {
+    if (skillAutoSyncTimer) {
+      clearInterval(skillAutoSyncTimer);
+      skillAutoSyncTimer = null;
+    }
+  }
+
+  // Initial start + restart when settings change (check every 60s)
+  const initSettings = getSystemSettings();
+  let _lastSkillSyncEnabled: boolean = initSettings.skillAutoSyncEnabled;
+  let _lastSkillSyncInterval: number = initSettings.skillAutoSyncIntervalMinutes;
+  startSkillAutoSync();
+
+  setInterval(() => {
+    const settings = getSystemSettings();
+    if (
+      settings.skillAutoSyncEnabled !== _lastSkillSyncEnabled ||
+      settings.skillAutoSyncIntervalMinutes !== _lastSkillSyncInterval
+    ) {
+      _lastSkillSyncEnabled = settings.skillAutoSyncEnabled;
+      _lastSkillSyncInterval = settings.skillAutoSyncIntervalMinutes;
+      startSkillAutoSync();
+    }
+  }, 60 * 1000);
+
   await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
   queue.setHostModeChecker((groupJid: string) => {
-    let group = registeredGroups[groupJid];
+    const baseJid = stripVirtualJidSuffix(groupJid);
+
+    let group = registeredGroups[baseJid];
     if (!group) {
-      const dbGroup = getRegisteredGroup(groupJid);
+      const dbGroup = getRegisteredGroup(baseJid);
       if (dbGroup) {
-        registeredGroups[groupJid] = dbGroup;
+        registeredGroups[baseJid] = dbGroup;
         group = dbGroup;
       }
     }
@@ -5253,6 +7006,14 @@ async function main(): Promise<void> {
       const folder = group?.folder || baseJid;
       return `${folder}#${agentId}`;
     }
+    // Task virtual JIDs: {chatJid}#task:{taskId} → separate serialization key
+    const taskSep = groupJid.indexOf('#task:');
+    if (taskSep >= 0) {
+      const baseJid = groupJid.slice(0, taskSep);
+      const taskId = groupJid.slice(taskSep + 6);
+      const group = registeredGroups[baseJid];
+      return `${group?.folder || baseJid}#task:${taskId}`;
+    }
     const group = registeredGroups[groupJid];
     return group?.folder || groupJid;
   });
@@ -5269,7 +7030,8 @@ async function main(): Promise<void> {
   // Billing: user-level concurrent container limit
   queue.setUserConcurrentLimitChecker((groupJid: string) => {
     if (!isBillingEnabled()) return { allowed: true };
-    const group = registeredGroups[groupJid];
+    const baseJid = stripVirtualJidSuffix(groupJid);
+    const group = registeredGroups[baseJid];
     if (!group?.created_by) return { allowed: true };
     const owner = getUserById(group.created_by);
     if (!owner || owner.role === 'admin') return { allowed: true };
@@ -5284,17 +7046,34 @@ async function main(): Promise<void> {
     }
     return { allowed: userActive < limit };
   });
-  startSchedulerLoop({
+  // Recovery: when agent process exits with unconsumed IPC messages,
+  // re-enqueue processAgentConversation to pick them up. See issue #240.
+  queue.setOnUnconsumedAgentIpc((groupJid: string, agentId: string) => {
+    // Extract base chat JID from virtual JID (e.g. web:main#agent:abc → web:main)
+    const baseChatJid = groupJid.includes('#agent:')
+      ? groupJid.split('#agent:')[0]
+      : groupJid;
+    const agent = getAgent(agentId);
+    const homeChatJid = agent?.chat_jid || baseChatJid;
+    const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+    const taskId = `agent-ipc-recovery:${agentId}:${Date.now()}`;
+    queue.enqueueTask(virtualChatJid, taskId, async () => {
+      await processAgentConversation(homeChatJid, agentId);
+    });
+  });
+  const schedulerDeps: import('./task-scheduler.js').SchedulerDependencies = {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder, displayName) =>
+    onProcess: (groupJid, proc, containerName, groupFolder, displayName, taskRunId) =>
       queue.registerProcess(
         groupJid,
         proc,
         containerName,
         groupFolder,
         displayName,
+        undefined, // agentId
+        taskRunId,
       ),
     sendMessage,
     assistantName: ASSISTANT_NAME,
@@ -5302,9 +7081,21 @@ async function main(): Promise<void> {
       logger,
       dataDir: DATA_DIR,
     },
-  });
+  };
+  startSchedulerLoop(schedulerDeps);
+
+  // Inject triggerTaskRun into WebDeps (schedulerDeps must exist first)
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    webDeps.triggerTaskRun = (taskId: string) =>
+      triggerTaskNow(taskId, schedulerDeps);
+  }
+
   startIpcWatcher();
+  recoverStreamingBuffer();
   recoverPendingMessages();
+  recoverConversationAgents();
+  startStreamingBuffer();
   startMessageLoop();
 
   // --- IM Connection Pool: connect shared + per-user IM channels ---
@@ -5353,7 +7144,7 @@ async function main(): Promise<void> {
           onBotAddedToGroup: buildOnNewChat('', ''),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
-          onInterruptRequest: handleIMInterruptRequest,
+          onCardInterrupt: handleCardInterrupt,
         },
       );
       logger.info({ connected: anyFeishuConnected }, 'Shared Feishu channel initialized');
@@ -5370,6 +7161,7 @@ async function main(): Promise<void> {
     const userFeishu = getUserFeishuConfig(user.id);
     const userTelegram = getUserTelegramConfig(user.id);
     const userQQ = getUserQQConfig(user.id);
+    const userWeChat = getUserWeChatConfig(user.id);
 
     // Determine effective Feishu config: per-user only
     let effectiveFeishu: FeishuConnectConfig | null = null;
@@ -5411,7 +7203,20 @@ async function main(): Promise<void> {
       };
     }
 
-    if (!effectiveFeishu && !effectiveTelegram && !effectiveQQ) continue;
+    // Determine effective WeChat config: per-user only (no global fallback)
+    let effectiveWeChat: WeChatConnectConfig | null = null;
+    if (userWeChat && userWeChat.botToken && userWeChat.ilinkBotId) {
+      effectiveWeChat = {
+        botToken: userWeChat.botToken,
+        ilinkBotId: userWeChat.ilinkBotId,
+        baseUrl: userWeChat.baseUrl,
+        cdnBaseUrl: userWeChat.cdnBaseUrl,
+        getUpdatesBuf: userWeChat.getUpdatesBuf,
+        enabled: userWeChat.enabled,
+      };
+    }
+
+    if (!effectiveFeishu && !effectiveTelegram && !effectiveQQ && !effectiveWeChat) continue;
 
     try {
       const result = await connectUserIMChannels(
@@ -5420,6 +7225,8 @@ async function main(): Promise<void> {
         effectiveFeishu,
         effectiveTelegram,
         effectiveQQ,
+        effectiveWeChat,
+        Date.now(),
       );
       if (result.feishu) anyFeishuConnected = true;
       logger.info(
@@ -5428,6 +7235,7 @@ async function main(): Promise<void> {
           feishu: result.feishu,
           telegram: result.telegram,
           qq: result.qq,
+          wechat: result.wechat,
         },
         'User IM channels connected',
       );
@@ -5509,6 +7317,10 @@ async function checkImBindingsHealth(): Promise<void> {
 
     try {
       const info = await imManager.getChatInfo(jid);
+      if (info === undefined) {
+        // Channel doesn't support getChatInfo (e.g. Telegram, QQ) — skip reachability check
+        continue;
+      }
       if (info === null) {
         // Chat not reachable — could be temporary (connection down, API permission issue)
         const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;
